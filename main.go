@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	_ "net/http/pprof" // Add this line to import pprof
+
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
@@ -90,6 +92,40 @@ type BotInstance struct {
 	Error     string // Last error message
 }
 
+type ExecutionResult struct {
+	Opportunity    *ArbitrageOpportunity
+	Success        bool
+	ExecutionTime  time.Duration
+	TxHash         common.Hash
+	GasUsed        uint64
+	ActualProfit   *big.Float
+	Error          string
+	Timestamp      time.Time
+	SimulationOnly bool
+}
+
+// TradeExecutor handles the execution of arbitrage opportunities
+type TradeExecutor struct {
+	config           *Configuration
+	logger           *Logger
+	client           *ethclient.Client
+	activeExecutions sync.Map
+	executionResults []*ExecutionResult
+	resultsMutex     sync.RWMutex
+	simulationMode   bool
+}
+
+// NewTradeExecutor creates a new instance of TradeExecutor
+func NewTradeExecutor(config *Configuration, logger *Logger, client *ethclient.Client) *TradeExecutor {
+	return &TradeExecutor{
+		config:           config,
+		logger:           logger,
+		client:           client,
+		executionResults: make([]*ExecutionResult, 0),
+		simulationMode:   true, // Start in simulation mode by default
+	}
+}
+
 // ArbitrageOpportunity represents a potential arbitrage opportunity
 type ArbitrageOpportunity struct {
 	Timestamp         time.Time  `json:"timestamp"`
@@ -104,15 +140,21 @@ type ArbitrageOpportunity struct {
 	ProfitPercent     *big.Float `json:"profitPercent"`
 	GasCost           *big.Float `json:"gasCost"`
 	EstimatedProfit   *big.Float `json:"estimatedProfit"`
-	ProfitInUSD       *big.Float `json:"profitInUSD"`      // New field for USD-denominated profit
-	ProfitInToken     *big.Float `json:"profitInToken"`    // New field for token-denominated profit
-	TradeAmountUSD    *big.Float `json:"tradeAmountUSD"`   // Trade size in USD
-	TradeAmountToken  *big.Float `json:"tradeAmountToken"` // Trade size in token units
+	ProfitInUSD       *big.Float `json:"profitInUSD"`
+	ProfitInToken     *big.Float `json:"profitInToken"`
+	TradeAmountUSD    *big.Float `json:"tradeAmountUSD"`
+	TradeAmountToken  *big.Float `json:"tradeAmountToken"`
 	IsViable          bool       `json:"isViable"`
 	LenderUsed        string     `json:"lenderUsed"`
 	ReserveA          *big.Int   `json:"reserveA"`
 	ReserveB          *big.Int   `json:"reserveB"`
 	RecommendedAmount *big.Float `json:"recommendedAmount"`
+
+	// New flash loan fields
+	FlashLoanAmount    *big.Float `json:"flashLoanAmount"`
+	FlashLoanProfitUSD *big.Float `json:"flashLoanProfitUSD"`
+	FlashLoanValueUSD  *big.Float `json:"flashLoanValueUSD"`
+	IsFlashLoanViable  bool       `json:"isFlashLoanViable"`
 }
 
 // ABIs for various contracts
@@ -152,6 +194,16 @@ const (
 		{"inputs":[],"name":"token0","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
 		{"inputs":[],"name":"token1","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}
 	]`
+
+	AaveV3PoolABI = `[
+        {"inputs":[{"internalType":"address","name":"receiverAddress","type":"address"},{"internalType":"address[]","name":"assets","type":"address[]"},{"internalType":"uint256[]","name":"amounts","type":"uint256[]"},{"internalType":"uint256[]","name":"interestRateModes","type":"uint256[]"},{"internalType":"address","name":"onBehalfOf","type":"address"},{"internalType":"bytes","name":"params","type":"bytes"},{"internalType":"uint16","name":"referralCode","type":"uint16"}],"name":"flashLoan","outputs":[],"stateMutability":"nonpayable","type":"function"},
+        {"inputs":[{"internalType":"address","name":"asset","type":"address"}],"name":"getReserveData","outputs":[{"components":[{"components":[{"internalType":"uint256","name":"data","type":"uint256"}],"internalType":"struct DataTypes.ReserveConfigurationMap","name":"configuration","type":"tuple"},{"internalType":"uint128","name":"liquidityIndex","type":"uint128"},{"internalType":"uint128","name":"currentLiquidityRate","type":"uint128"},{"internalType":"uint128","name":"variableBorrowIndex","type":"uint128"},{"internalType":"uint128","name":"currentVariableBorrowRate","type":"uint128"},{"internalType":"uint128","name":"currentStableBorrowRate","type":"uint128"},{"internalType":"uint40","name":"lastUpdateTimestamp","type":"uint40"},{"internalType":"uint16","name":"id","type":"uint16"},{"internalType":"address","name":"aTokenAddress","type":"address"},{"internalType":"address","name":"stableDebtTokenAddress","type":"address"},{"internalType":"address","name":"variableDebtTokenAddress","type":"address"},{"internalType":"address","name":"interestRateStrategyAddress","type":"address"},{"internalType":"uint128","name":"accruedToTreasury","type":"uint128"},{"internalType":"uint128","name":"unbacked","type":"uint128"},{"internalType":"uint128","name":"isolationModeTotalDebt","type":"uint128"}],"internalType":"struct DataTypes.ReserveData","name":"","type":"tuple"}],"stateMutability":"view","type":"function"}
+    ]`
+
+	// Aave V3 Flash Loan Receiver Interface
+	AaveV3FlashLoanReceiverABI = `[
+        {"inputs":[{"internalType":"address[]","name":"assets","type":"address[]"},{"internalType":"uint256[]","name":"amounts","type":"uint256[]"},{"internalType":"uint256[]","name":"premiums","type":"uint256[]"},{"internalType":"address","name":"initiator","type":"address"},{"internalType":"bytes","name":"params","type":"bytes"}],"name":"executeOperation","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}
+    ]`
 )
 
 // DEX represents a decentralized exchange
@@ -267,7 +319,7 @@ type MonitorService struct {
 	workerWg    sync.WaitGroup
 	pairWorkers map[string]context.CancelFunc
 	workerMutex sync.Mutex
-
+	executor    *TradeExecutor
 	// Config file path
 	configPath string
 }
@@ -325,6 +377,8 @@ func NewMonitorService(configPath string) (*MonitorService, error) {
 		}
 	}
 
+	executor := NewTradeExecutor(config, logger, client)
+
 	return &MonitorService{
 		config:        config,
 		client:        client,
@@ -338,6 +392,7 @@ func NewMonitorService(configPath string) (*MonitorService, error) {
 		pairWorkers:   make(map[string]context.CancelFunc),
 		bots:          bots,
 		configPath:    configPath,
+		executor:      executor,
 	}, nil
 }
 
@@ -426,6 +481,15 @@ func (m *MonitorService) Start() {
 
 	// Save opportunities periodically
 	go m.periodicTasks()
+
+	// Add this near the beginning of your main function or where you start your service
+	go func() {
+		m.logger.Info("Starting pprof server on port 6060")
+		err := http.ListenAndServe("localhost:6060", nil)
+		if err != nil {
+			m.logger.Error("Failed to start pprof server: %v", err)
+		}
+	}()
 }
 
 // periodicTasks runs tasks that need to be performed periodically
@@ -920,7 +984,7 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 	var lowestDEX, highestDEX string
 	var lowestPrice, highestPrice *big.Float
 	var lowestVersion, highestVersion string
-	var lowestReserveA, lowestReserveB *big.Int
+	var lowestReserveA, lowestReserveB, highestReserveA, highestReserveB *big.Int
 
 	for dexName, info := range dexInfos {
 		if lowestPrice == nil || info.price.Cmp(lowestPrice) < 0 {
@@ -935,8 +999,8 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 			highestDEX = dexName
 			highestPrice = info.price
 			highestVersion = info.version
-			// highestReserveA = info.reserveA
-			// highestReserveB = info.reserveB
+			highestReserveA = info.reserveA
+			highestReserveB = info.reserveB
 		}
 	}
 
@@ -980,9 +1044,9 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 			}
 		}
 
-		// Estimate gas cost (simplified)
+		// IMPROVED: Use a more realistic gas estimate
 		gasPrice, _ := new(big.Int).SetString(m.config.GasSettings.MaxGasPrice, 10)
-		gasLimit := big.NewInt(500000) // Estimated gas for arbitrage transaction
+		gasLimit := big.NewInt(300000) // Reduced from 500,000 to a more realistic 300,000
 		gasCostWei := new(big.Int).Mul(gasPrice, gasLimit)
 
 		// Convert gas cost to ETH
@@ -991,19 +1055,61 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 			new(big.Float).SetInt(big.NewInt(1000000000000000000)), // 10^18 (wei to ETH)
 		)
 
-		// Estimate ETH price in USD (for gas cost calculation)
-		ethPriceInUSD := big.NewFloat(2000) // Simplified, should be fetched from an oracle
+		// Use current ETH price for better accuracy
+		ethPriceInUSD := big.NewFloat(2500) // Updated from 2000 to 2500
 
 		// Calculate gas cost in USD
 		gasCostUSD := new(big.Float).Mul(gasCostETH, ethPriceInUSD)
 
-		// Calculate a reasonable trade size based on reserves
-		// For more conservative approach, use 0.5-1% of reserves
+		// IMPROVED: Calculate optimal trade size based on price difference and reserves
+		// We'll use both sets of reserves to determine which is limiting
 		reserveAFloat := new(big.Float).SetInt(lowestReserveA)
-		tradeSizePercent := big.NewFloat(0.005) // 0.5% of reserves
+		highestReserveAFloat := new(big.Float).SetInt(highestReserveA)
 
-		// Calculate trade size in token A
+		// Convert B reserves to floats as well - used for calculating max swap amounts
+		reserveBFloat := new(big.Float).SetInt(lowestReserveB)
+		highestReserveBFloat := new(big.Float).SetInt(highestReserveB)
+
+		var tradeSizePercent *big.Float
+
+		// Get price gap percentage as float for easier handling
+		percentFloat, _ := priceGapPercent.Float64()
+
+		// Dynamically adjust trade size based on price difference
+		if percentFloat > 20 {
+			tradeSizePercent = big.NewFloat(0.02) // 2% for huge opportunities (>20%)
+		} else if percentFloat > 10 {
+			tradeSizePercent = big.NewFloat(0.01) // 1% for large opportunities (10-20%)
+		} else if percentFloat > 5 {
+			tradeSizePercent = big.NewFloat(0.005) // 0.5% for medium opportunities (5-10%)
+		} else {
+			tradeSizePercent = big.NewFloat(0.002) // 0.2% for small opportunities (<5%)
+		}
+
+		// Calculate base trade size in token A using lowest DEX's reserves
 		tradeAmountInTokenA := new(big.Float).Mul(reserveAFloat, tradeSizePercent)
+
+		// Also calculate a trade size based on highest DEX's reserves
+		highestTradeAmountInTokenA := new(big.Float).Mul(highestReserveAFloat, tradeSizePercent)
+
+		// Take the smaller of the two to ensure the trade will work in both DEXes
+		if highestTradeAmountInTokenA.Cmp(tradeAmountInTokenA) < 0 {
+			tradeAmountInTokenA = highestTradeAmountInTokenA
+		}
+
+		// Also check reserve B limits (useful for determining maximum swap amounts)
+		// This helps prevent situations where the token B reserves are too low for the trade
+		tradeAmountInTokenB := new(big.Float).Mul(reserveBFloat, tradeSizePercent)
+		highestTradeAmountInTokenB := new(big.Float).Mul(highestReserveBFloat, tradeSizePercent)
+
+		// Make sure we're not trying to swap more than available in reserve B
+		if highestTradeAmountInTokenB.Cmp(tradeAmountInTokenB) < 0 {
+			// Adjust tokenA amount based on reserveB limitations
+			tradeAmountInTokenB = highestTradeAmountInTokenB
+
+			// Convert back to tokenA equivalent using the price ratio
+			tradeAmountInTokenA = new(big.Float).Quo(tradeAmountInTokenB, lowestPrice)
+		}
 
 		// Convert to human-readable token units by dividing by 10^decimals
 		divisor := new(big.Float).SetInt(new(big.Int).Exp(
@@ -1011,42 +1117,156 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 		))
 		tradeAmountHumanReadable := new(big.Float).Quo(tradeAmountInTokenA, divisor)
 
-		// Calculate trade value in USD
+		// Calculate trade value in USD with better accuracy
 		var tradeValueUSD *big.Float
+
 		if isStablecoin(tokenA.Symbol) {
 			// If token A is a stablecoin, its value is approximately its amount
-			tradeValueUSD = tradeAmountHumanReadable
+			tradeValueUSD = new(big.Float).Copy(tradeAmountHumanReadable)
 		} else if isStablecoin(tokenB.Symbol) {
 			// If token B is a stablecoin, multiply by the average price
 			avgPrice := new(big.Float).Add(lowestPrice, highestPrice)
 			avgPrice = new(big.Float).Quo(avgPrice, big.NewFloat(2))
 			tradeValueUSD = new(big.Float).Mul(tradeAmountHumanReadable, avgPrice)
 		} else {
-			// Neither token is a stablecoin, make a rough estimate
-			// This should ideally use an oracle
-			tradeValueUSD = big.NewFloat(1000) // Default to $1000 for demonstration
+			// IMPROVED: Better estimate for non-stablecoin pairs
+			// This would ideally use a price oracle, but we'll make a more reasonable estimate
+			// Use the reserves to calculate an approximate USD value
+			// For example, if reserveB is a significant amount of ETH/WETH, we can estimate value
+
+			// Check if either token might be WETH or ETH
+			isTokenAEth := strings.Contains(strings.ToLower(tokenA.Symbol), "eth")
+			isTokenBEth := strings.Contains(strings.ToLower(tokenB.Symbol), "eth")
+
+			if isTokenAEth {
+				// If trading ETH, just multiply by ETH price
+				tradeValueUSD = new(big.Float).Mul(tradeAmountHumanReadable, ethPriceInUSD)
+			} else if isTokenBEth {
+				// If trading against ETH, convert to ETH value first then to USD
+				ethValue := new(big.Float).Mul(tradeAmountHumanReadable, lowestPrice)
+				tradeValueUSD = new(big.Float).Mul(ethValue, ethPriceInUSD)
+			} else {
+				// Default fallback
+				tradeValueUSD = big.NewFloat(500) // Default to a moderate value for testing
+			}
 		}
 
-		// Calculate profit in token units (simplified)
-		profitInToken := new(big.Float).Mul(tradeAmountHumanReadable, priceGapPercent)
-		profitInToken = new(big.Float).Quo(profitInToken, big.NewFloat(100))
+		// IMPROVED: Calculate profit per token (just the price difference)
+		profitPerToken := new(big.Float).Copy(priceGap)
 
-		// Calculate profit in USD
-		profitInUSD := new(big.Float).Mul(tradeValueUSD, priceGapPercent)
-		profitInUSD = new(big.Float).Quo(profitInUSD, big.NewFloat(100))
+		// Calculate profit in token units - this is more accurate
+		profitInToken := new(big.Float).Mul(tradeAmountHumanReadable, new(big.Float).Quo(priceGapPercent, big.NewFloat(100)))
 
-		// Subtract gas cost
+		// IMPROVED: Calculate profit in USD more accurately
+		// This is the amount of tokens × price difference
+		profitInUSD := new(big.Float).Mul(tradeAmountHumanReadable, priceGap)
+
+		// Get raw profit before gas costs
+		rawProfitUSD := new(big.Float).Copy(profitInUSD)
+
+		// Subtract gas cost for net profit
 		netProfitUSD := new(big.Float).Sub(profitInUSD, gasCostUSD)
 
-		// Determine if profitable based on USD profit threshold
-		percentFloat, _ := priceGapPercent.Float64()
+		// FLASH LOAN CALCULATION
+		// Calculate optimal flash loan amount for maximum profit
+		flashLoanFeePercent := big.NewFloat(0.09) // 0.09% fee for Aave V2
 
-		// Viable if net USD profit > minimum threshold and percentage is reasonable
-		isViable := netProfitUSD.Cmp(minProfitUSD) > 0 && percentFloat >= 0.5
+		// Calculate maximum possible trade size based on DEX reserves
+		// For optimal flash loan, we need to consider:
+		// 1. DEX slippage as size increases
+		// 2. Flash loan fees
+		// 3. Gas costs
 
-		// If profit percentage is very high (>5%), consider viable even with lower absolute profit
+		// A simplified approach is to estimate using a larger percentage of reserves
+		flashLoanPercent := big.NewFloat(0.05) // Try with 5% of reserves
+		flashLoanAmountTokenA := new(big.Float).Mul(reserveAFloat, flashLoanPercent)
+
+		// Make sure we're not exceeding reserve B limitations
+		flashLoanAmountTokenB := new(big.Float).Mul(reserveBFloat, flashLoanPercent)
+		highestFlashLoanAmountTokenB := new(big.Float).Mul(highestReserveBFloat, flashLoanPercent)
+
+		// Use the more limiting factor
+		if highestFlashLoanAmountTokenB.Cmp(flashLoanAmountTokenB) < 0 {
+			flashLoanAmountTokenB = highestFlashLoanAmountTokenB
+			flashLoanAmountTokenA = new(big.Float).Quo(flashLoanAmountTokenB, lowestPrice)
+		}
+
+		// Convert to human-readable amount
+		flashLoanHumanReadable := new(big.Float).Quo(flashLoanAmountTokenA, divisor)
+
+		// Calculate flash loan fee
+		flashLoanFee := new(big.Float).Mul(
+			flashLoanHumanReadable,
+			new(big.Float).Quo(flashLoanFeePercent, big.NewFloat(100)),
+		)
+
+		// Calculate potential profit from flash loan
+		flashLoanProfitPerToken := new(big.Float).Copy(profitPerToken)
+		flashLoanRawProfit := new(big.Float).Mul(flashLoanHumanReadable, flashLoanProfitPerToken)
+
+		// Subtract flash loan fee
+		flashLoanProfitAfterFee := new(big.Float).Sub(flashLoanRawProfit, flashLoanFee)
+
+		// Subtract gas costs
+		flashLoanNetProfit := new(big.Float).Sub(flashLoanProfitAfterFee, gasCostUSD)
+
+		// Calculate flash loan profit in USD
+		flashLoanProfitUSD := flashLoanNetProfit
+
+		// Convert to USD if needed
+		if !isStablecoin(tokenA.Symbol) && isStablecoin(tokenB.Symbol) {
+			// If the asset isn't a stablecoin but we're trading against one,
+			// multiply by average price to get USD value
+			avgPrice := new(big.Float).Add(lowestPrice, highestPrice)
+			avgPrice = new(big.Float).Quo(avgPrice, big.NewFloat(2))
+			flashLoanProfitUSD = new(big.Float).Mul(flashLoanNetProfit, avgPrice)
+		}
+
+		// Calculate flash loan trade value in USD
+		var flashLoanValueUSD *big.Float
+
+		if isStablecoin(tokenA.Symbol) {
+			flashLoanValueUSD = new(big.Float).Copy(flashLoanHumanReadable)
+		} else if isStablecoin(tokenB.Symbol) {
+			avgPrice := new(big.Float).Add(lowestPrice, highestPrice)
+			avgPrice = new(big.Float).Quo(avgPrice, big.NewFloat(2))
+			flashLoanValueUSD = new(big.Float).Mul(flashLoanHumanReadable, avgPrice)
+		} else {
+			// Use same logic as regular trade, but with flash loan amount
+			isTokenAEth := strings.Contains(strings.ToLower(tokenA.Symbol), "eth")
+			isTokenBEth := strings.Contains(strings.ToLower(tokenB.Symbol), "eth")
+
+			if isTokenAEth {
+				flashLoanValueUSD = new(big.Float).Mul(flashLoanHumanReadable, ethPriceInUSD)
+			} else if isTokenBEth {
+				ethValue := new(big.Float).Mul(flashLoanHumanReadable, lowestPrice)
+				flashLoanValueUSD = new(big.Float).Mul(ethValue, ethPriceInUSD)
+			} else {
+				// Default estimate
+				flashLoanValueUSD = big.NewFloat(2000) // Higher value for flash loan
+			}
+		}
+
+		// Get dynamic profit threshold based on gas costs
+		dynamicMinProfit := new(big.Float).Mul(gasCostUSD, big.NewFloat(1.2))    // 20% above gas
+		dynamicMinProfit = new(big.Float).Add(dynamicMinProfit, big.NewFloat(1)) // plus $1 base profit
+
+		// Don't go below configured minimum
+		if dynamicMinProfit.Cmp(minProfitUSD) < 0 {
+			dynamicMinProfit = minProfitUSD
+		}
+
+		// Check both normal trade and flash loan viability
+		isViable := netProfitUSD.Cmp(dynamicMinProfit) > 0 && percentFloat >= 0.5
+		isFlashLoanViable := flashLoanNetProfit.Cmp(dynamicMinProfit) > 0 && percentFloat >= 0.5
+
+		// High percentage opportunities with positive profit are viable even with lower absolute profit
 		if percentFloat >= 5.0 && netProfitUSD.Cmp(big.NewFloat(0)) > 0 {
 			isViable = true
+		}
+
+		if percentFloat >= 3.0 && flashLoanNetProfit.Cmp(big.NewFloat(0)) > 0 {
+			isFlashLoanViable = true
 		}
 
 		// Create opportunity with proper scaling
@@ -1063,7 +1283,7 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 			ProfitPercent:     priceGapPercent,
 			GasCost:           gasCostUSD,
 			EstimatedProfit:   netProfitUSD,
-			ProfitInUSD:       netProfitUSD,
+			ProfitInUSD:       rawProfitUSD,
 			ProfitInToken:     profitInToken,
 			TradeAmountUSD:    tradeValueUSD,
 			TradeAmountToken:  tradeAmountHumanReadable,
@@ -1072,15 +1292,128 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 			ReserveA:          lowestReserveA,
 			ReserveB:          lowestReserveB,
 			RecommendedAmount: tradeAmountHumanReadable,
+
+			// Add flash loan information to the opportunity
+			FlashLoanAmount:    flashLoanHumanReadable,
+			FlashLoanProfitUSD: flashLoanProfitUSD,
+			FlashLoanValueUSD:  flashLoanValueUSD,
+			IsFlashLoanViable:  isFlashLoanViable,
 		}
 
-		// Log opportunity
-		m.logger.Opportunity(opportunity)
+		// Log opportunity with the improved logger
+		m.logOpportunity(opportunity)
 
 		// Store opportunity
 		m.opportunityMu.Lock()
 		m.opportunities = append(m.opportunities, opportunity)
 		m.opportunityMu.Unlock()
+
+		// NEW CODE: Send viable opportunities to the executor
+		if opportunity.IsViable || opportunity.IsFlashLoanViable {
+			// Create context with timeout for execution
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			// Execute the opportunity (this will simulate or execute based on configuration)
+			go m.executor.ExecuteArbitrageOpportunity(ctx, opportunity)
+		}
+	}
+}
+
+func (m *MonitorService) logOpportunity(opp *ArbitrageOpportunity) {
+	// Use the existing logger's mutex
+	m.logger.mu.Lock()
+	defer m.logger.mu.Unlock()
+
+	// Format profits with appropriate scaling
+	rawProfitFloat, _ := opp.ProfitInUSD.Float64()
+	netProfitFloat, _ := opp.EstimatedProfit.Float64()
+	gasCostFloat, _ := opp.GasCost.Float64()
+
+	rawProfitStr := fmt.Sprintf("$%.2f", rawProfitFloat)
+	netProfitStr := fmt.Sprintf("$%.2f", netProfitFloat)
+
+	buyPriceStr := opp.BuyPrice.Text('f', 6)
+	sellPriceStr := opp.SellPrice.Text('f', 6)
+
+	// Get percentage as float
+	percentFloat, _ := opp.ProfitPercent.Float64()
+
+	// Get trade amount
+	tradeAmountFloat, _ := opp.TradeAmountToken.Float64()
+	tradeValueFloat, _ := opp.TradeAmountUSD.Float64()
+
+	// Flash loan info
+	flashLoanAmountFloat, _ := opp.FlashLoanAmount.Float64()
+	flashLoanProfitFloat, _ := opp.FlashLoanProfitUSD.Float64()
+	flashLoanValueFloat, _ := opp.FlashLoanValueUSD.Float64()
+
+	// Show most profitable opportunity first
+	if opp.IsFlashLoanViable && flashLoanProfitFloat > netProfitFloat {
+		color.New(color.FgHiWhite, color.BgGreen).Printf(
+			"[FLASH LOAN OPPORTUNITY] %s: Buy on %s (%s) at %s, sell on %s (%s) at %s. Profit: $%.2f (%.2f%%) 💸\n",
+			opp.PairKey, opp.BuyDEX, opp.BuyDEXVersion, buyPriceStr,
+			opp.SellDEX, opp.SellDEXVersion, sellPriceStr, flashLoanProfitFloat, percentFloat,
+		)
+
+		fmt.Printf("  Flash Loan: %.4f tokens ($%.2f) | Gas: $%.2f | Net Profit: $%.2f\n",
+			flashLoanAmountFloat, flashLoanValueFloat, gasCostFloat, flashLoanProfitFloat)
+
+		// If normal trade is also viable, show that too
+		if opp.IsViable {
+			fmt.Printf("  Regular Trade: %.4f tokens ($%.2f) | Net Profit: %s\n",
+				tradeAmountFloat, tradeValueFloat, netProfitStr)
+		}
+	} else if opp.IsViable {
+		color.New(color.FgHiWhite, color.BgGreen).Printf(
+			"[VIABLE OPPORTUNITY] %s: Buy on %s (%s) at %s, sell on %s (%s) at %s. Profit: %s (%.2f%%) 🚀\n",
+			opp.PairKey, opp.BuyDEX, opp.BuyDEXVersion, buyPriceStr,
+			opp.SellDEX, opp.SellDEXVersion, sellPriceStr, netProfitStr, percentFloat,
+		)
+
+		// Add detailed information about the trade
+		fmt.Printf("  Trade: %.4f tokens ($%.2f) | Gas: $%.2f | Raw Profit: %s | Net Profit: %s\n",
+			tradeAmountFloat, tradeValueFloat, gasCostFloat, rawProfitStr, netProfitStr)
+
+		// Show flash loan info if it's viable but less profitable
+		if opp.IsFlashLoanViable {
+			fmt.Printf("  Alternative Flash Loan: %.4f tokens | Profit: $%.2f\n",
+				flashLoanAmountFloat, flashLoanProfitFloat)
+		}
+	} else if opp.IsFlashLoanViable {
+		color.New(color.FgHiWhite, color.BgYellow).Printf(
+			"[FLASH LOAN ONLY] %s: Buy on %s (%s) at %s, sell on %s (%s) at %s. Flash Loan Profit: $%.2f (%.2f%%)\n",
+			opp.PairKey, opp.BuyDEX, opp.BuyDEXVersion, buyPriceStr,
+			opp.SellDEX, opp.SellDEXVersion, sellPriceStr, flashLoanProfitFloat, percentFloat,
+		)
+
+		fmt.Printf("  Flash Loan: %.4f tokens ($%.2f) | Gas: $%.2f | Net Profit: $%.2f\n",
+			flashLoanAmountFloat, flashLoanValueFloat, gasCostFloat, flashLoanProfitFloat)
+
+		fmt.Printf("  Regular trade not viable: Net profit $%.2f is below threshold\n",
+			netProfitFloat)
+	} else if percentFloat >= 5.0 {
+		// Show potential opportunities that have good percentage but aren't viable due to gas
+		color.New(color.FgHiWhite, color.BgYellow).Printf(
+			"[POTENTIAL OPPORTUNITY] %s: Buy on %s (%s) at %s, sell on %s (%s) at %s. Profit before gas: %s (%.2f%%)\n",
+			opp.PairKey, opp.BuyDEX, opp.BuyDEXVersion, buyPriceStr,
+			opp.SellDEX, opp.SellDEXVersion, sellPriceStr, rawProfitStr, percentFloat,
+		)
+
+		// Explain why it's not viable
+		if netProfitFloat <= 0 {
+			fmt.Printf("  Not viable: Gas cost ($%.2f) exceeds raw profit (%s)\n",
+				gasCostFloat, rawProfitStr)
+		} else {
+			fmt.Printf("  Trade: %.4f tokens | Gas: $%.2f | Net profit too low: %s\n",
+				tradeAmountFloat, gasCostFloat, netProfitStr)
+		}
+	} else {
+		color.New(color.FgHiWhite, color.BgBlue).Printf(
+			"[LOW OPPORTUNITY] %s: Buy on %s (%s) at %s, sell on %s (%s) at %s. Price diff: %.2f%% - Below threshold\n",
+			opp.PairKey, opp.BuyDEX, opp.BuyDEXVersion, buyPriceStr,
+			opp.SellDEX, opp.SellDEXVersion, sellPriceStr, percentFloat,
+		)
 	}
 }
 
@@ -1110,6 +1443,8 @@ func (m *MonitorService) startAPIServer() {
 	router.HandleFunc("/api/opportunities", m.handleGetOpportunities).Methods("GET")
 	router.HandleFunc("/api/bots", m.handleGetBots).Methods("GET")
 
+	router.HandleFunc("/api/execution/results", m.handleGetExecutionResults).Methods("GET")
+	router.HandleFunc("/api/execution/mode", m.handleSetSimulationMode).Methods("POST")
 	// Start server
 	port := m.config.APIPort
 	if port == "" {
@@ -1655,6 +1990,33 @@ func (m *MonitorService) handleGetBots(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(m.bots)
 }
 
+// Add an API endpoint to get execution results
+func (m *MonitorService) handleGetExecutionResults(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	results := m.executor.GetExecutionResults()
+	json.NewEncoder(w).Encode(results)
+}
+
+// Add an API endpoint to toggle simulation mode
+func (m *MonitorService) handleSetSimulationMode(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Simulation bool `json:"simulation"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	m.executor.SetSimulationMode(request.Simulation)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "success",
+		"mode":   map[bool]string{true: "simulation", false: "real_execution"}[request.Simulation],
+	})
+}
+
 // Helper Methods
 
 func (m *MonitorService) isPairBeingMonitored(pairKey string) bool {
@@ -1856,6 +2218,245 @@ func getLenderForPair(config *Configuration, lenderPreference string) string {
 	return config.DefaultLender
 }
 
+// ExecuteArbitrageOpportunity processes a profitable opportunity
+// and either simulates or executes the trade based on configuration
+func (e *TradeExecutor) ExecuteArbitrageOpportunity(ctx context.Context, opportunity *ArbitrageOpportunity) {
+	// Generate a unique key for this execution
+	executionKey := fmt.Sprintf("%s-%d", opportunity.PairKey, opportunity.Timestamp.UnixNano())
+
+	// Check if we're already processing this opportunity
+	if _, exists := e.activeExecutions.Load(executionKey); exists {
+		e.logger.Warning("Already processing opportunity: %s", executionKey)
+		return
+	}
+
+	// Mark this opportunity as being processed
+	e.activeExecutions.Store(executionKey, true)
+
+	// Start execution timer
+	startTime := time.Now()
+
+	// Create a result to track this execution
+	result := &ExecutionResult{
+		Opportunity:    opportunity,
+		Timestamp:      time.Now(),
+		SimulationOnly: e.simulationMode,
+	}
+
+	// Choose execution method based on profitability
+	var err error
+	if opportunity.IsFlashLoanViable &&
+		opportunity.FlashLoanProfitUSD != nil &&
+		opportunity.EstimatedProfit != nil &&
+		opportunity.FlashLoanProfitUSD.Cmp(opportunity.EstimatedProfit) > 0 {
+		// Flash loan is more profitable
+		e.logger.Info("Executing flash loan arbitrage for %s", opportunity.PairKey)
+		err = e.executeFlashLoanArbitrage(ctx, opportunity, result)
+	} else if opportunity.IsViable {
+		// Regular arbitrage is viable
+		e.logger.Info("Executing regular arbitrage for %s", opportunity.PairKey)
+		err = e.executeRegularArbitrage(ctx, opportunity, result)
+	} else {
+		// This shouldn't happen, but just in case
+		err = fmt.Errorf("opportunity is not viable for execution")
+	}
+
+	// Set execution time
+	result.ExecutionTime = time.Since(startTime)
+
+	// Handle any execution errors
+	if err != nil {
+		result.Success = false
+		result.Error = err.Error()
+		e.logger.Error("Arbitrage execution failed: %v", err)
+	} else {
+		result.Success = true
+		e.logger.Success("Arbitrage execution completed successfully in %v", result.ExecutionTime)
+	}
+
+	// Store the execution result
+	e.resultsMutex.Lock()
+	e.executionResults = append(e.executionResults, result)
+	e.resultsMutex.Unlock()
+
+	// Remove from active executions
+	e.activeExecutions.Delete(executionKey)
+
+	// Log the execution result
+	e.logExecutionResult(result)
+}
+
+// Simulation for regular arbitrage
+func (e *TradeExecutor) executeRegularArbitrage(ctx context.Context, opp *ArbitrageOpportunity, result *ExecutionResult) error {
+	if !e.simulationMode {
+		// In real mode, this would contain the actual transaction code
+		return fmt.Errorf("real execution mode not implemented")
+	}
+
+	// This is just simulation logic
+	e.logger.Info("Simulating regular arbitrage execution for %s", opp.PairKey)
+
+	// Simulate the trading steps:
+	// 1. First simulate approval for token spending
+	e.logger.Info("Simulating token approval...")
+	time.Sleep(200 * time.Millisecond)
+
+	// 2. Simulate swap on first DEX
+	e.logger.Info("Simulating swap on %s...", opp.BuyDEX)
+	time.Sleep(500 * time.Millisecond)
+
+	// 3. Simulate swap on second DEX
+	e.logger.Info("Simulating swap on %s...", opp.SellDEX)
+	time.Sleep(500 * time.Millisecond)
+
+	// Generate a fake transaction hash
+	result.TxHash = common.HexToHash(fmt.Sprintf("0x%064x", time.Now().UnixNano()))
+
+	// Simulate gas used - slightly random to mimic real behavior
+	baseGas := uint64(180000)                                // Base gas for a regular arbitrage
+	randomVariation := uint64(time.Now().UnixNano() % 40000) // Random variation
+	result.GasUsed = baseGas + randomVariation
+
+	// Calculate actual profit (in simulation, we'll use a random factor around estimated)
+	profitFactor := 0.8 + (float64(time.Now().UnixNano()%4000) / 10000.0) // 0.8 to 1.2
+	estProfit, _ := opp.EstimatedProfit.Float64()
+	actualProfit := estProfit * profitFactor
+	result.ActualProfit = big.NewFloat(actualProfit)
+
+	return nil
+}
+
+// Simulation for flash loan arbitrage
+func (e *TradeExecutor) executeFlashLoanArbitrage(ctx context.Context, opp *ArbitrageOpportunity, result *ExecutionResult) error {
+	if !e.simulationMode {
+		// In real mode, this would contain the actual transaction code
+		return fmt.Errorf("real execution mode not implemented")
+	}
+
+	// This is just simulation logic
+	e.logger.Info("Simulating flash loan arbitrage execution for %s", opp.PairKey)
+
+	// Simulate the trading steps:
+	e.logger.Info("Simulating flash loan from %s...", opp.LenderUsed)
+	time.Sleep(300 * time.Millisecond)
+
+	// Simulate first swap
+	e.logger.Info("Simulating swap on %s...", opp.BuyDEX)
+	time.Sleep(500 * time.Millisecond)
+
+	// Simulate second swap
+	e.logger.Info("Simulating swap on %s...", opp.SellDEX)
+	time.Sleep(500 * time.Millisecond)
+
+	// Simulate loan repayment
+	e.logger.Info("Simulating flash loan repayment...")
+	time.Sleep(200 * time.Millisecond)
+
+	// Generate a fake transaction hash
+	result.TxHash = common.HexToHash(fmt.Sprintf("0x%064x", time.Now().UnixNano()))
+
+	// Simulate gas used - flash loans use more gas
+	baseGas := uint64(350000)                                // Base gas for a flash loan arbitrage
+	randomVariation := uint64(time.Now().UnixNano() % 50000) // Random variation
+	result.GasUsed = baseGas + randomVariation
+
+	// Calculate actual profit (in simulation, we'll use a random factor around estimated)
+	profitFactor := 0.75 + (float64(time.Now().UnixNano()%5000) / 10000.0) // 0.75 to 1.25
+	estProfit, _ := opp.FlashLoanProfitUSD.Float64()
+	actualProfit := estProfit * profitFactor
+	result.ActualProfit = big.NewFloat(actualProfit)
+
+	return nil
+}
+
+// Log the execution result
+func (e *TradeExecutor) logExecutionResult(result *ExecutionResult) {
+	// Use mutex to protect logging
+	e.logger.mu.Lock()
+	defer e.logger.mu.Unlock()
+
+	// Determine color and label based on success
+	if result.Success {
+		if result.SimulationOnly {
+			fmt.Println()
+			color.New(color.FgHiWhite, color.BgBlue).Printf(
+				"[SIMULATION SUCCESS] %s - %s\n",
+				result.Opportunity.PairKey,
+				result.TxHash.Hex(),
+			)
+		} else {
+			fmt.Println()
+			color.New(color.FgHiWhite, color.BgGreen).Printf(
+				"[EXECUTION SUCCESS] %s - %s\n",
+				result.Opportunity.PairKey,
+				result.TxHash.Hex(),
+			)
+		}
+
+		// Show profit comparison
+		actualProfitFloat, _ := result.ActualProfit.Float64()
+		estimatedProfitFloat := 0.0
+
+		// Determine which profit estimate to use
+		if result.Opportunity.IsFlashLoanViable &&
+			result.Opportunity.FlashLoanProfitUSD != nil &&
+			result.Opportunity.EstimatedProfit != nil &&
+			result.Opportunity.FlashLoanProfitUSD.Cmp(result.Opportunity.EstimatedProfit) > 0 {
+			estimatedProfitFloat, _ = result.Opportunity.FlashLoanProfitUSD.Float64()
+		} else {
+			estimatedProfitFloat, _ = result.Opportunity.EstimatedProfit.Float64()
+		}
+
+		// Calculate profit accuracy
+		profitAccuracy := (actualProfitFloat / estimatedProfitFloat) * 100
+
+		fmt.Printf("  Execution time: %v | Gas used: %d\n", result.ExecutionTime, result.GasUsed)
+		fmt.Printf("  Expected profit: $%.2f | Actual profit: $%.2f (%.1f%% of estimate)\n",
+			estimatedProfitFloat, actualProfitFloat, profitAccuracy)
+
+		// Show appropriate execution method
+		if result.Opportunity.IsFlashLoanViable &&
+			result.Opportunity.FlashLoanProfitUSD != nil &&
+			result.Opportunity.EstimatedProfit != nil &&
+			result.Opportunity.FlashLoanProfitUSD.Cmp(result.Opportunity.EstimatedProfit) > 0 {
+			fmt.Printf("  Method: Flash Loan via %s\n", result.Opportunity.LenderUsed)
+		} else {
+			fmt.Printf("  Method: Regular Arbitrage\n")
+		}
+	} else {
+		fmt.Println()
+		color.New(color.FgHiWhite, color.BgRed).Printf(
+			"[EXECUTION FAILED] %s - Error: %s\n",
+			result.Opportunity.PairKey,
+			result.Error,
+		)
+		fmt.Printf("  Execution time: %v\n", result.ExecutionTime)
+		fmt.Printf("  Mode: %s\n", map[bool]string{true: "Simulation", false: "Real Execution"}[result.SimulationOnly])
+	}
+}
+
+// Get a summary of execution results
+func (e *TradeExecutor) GetExecutionResults() []*ExecutionResult {
+	e.resultsMutex.RLock()
+	defer e.resultsMutex.RUnlock()
+
+	// Return a copy to avoid race conditions
+	results := make([]*ExecutionResult, len(e.executionResults))
+	copy(results, e.executionResults)
+
+	return results
+}
+
+// SetSimulationMode toggles between simulation and real execution
+func (e *TradeExecutor) SetSimulationMode(simulate bool) {
+	e.simulationMode = simulate
+	if simulate {
+		e.logger.Info("Trade executor set to SIMULATION mode - no real transactions will be sent")
+	} else {
+		e.logger.Warning("Trade executor set to REAL EXECUTION mode - trades will be executed on-chain")
+	}
+}
+
 func main() {
 	// Parse command line flags
 	configPath := flag.String("config", "config.json", "Path to configuration file")
@@ -1872,7 +2473,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create monitor service: %v", err)
 	}
-
 	// Start monitor service
 	service.Start()
 
