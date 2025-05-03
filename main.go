@@ -27,6 +27,24 @@ import (
 	"github.com/gorilla/mux"
 )
 
+// Aave-supported assets (configurable in production)
+var aaveSupportedAssets = map[string]bool{
+	"USDC": true,
+	"USDT": true,
+	"DAI":  true,
+	"WBTC": true,
+	"WETH": true,
+	"LINK": true,
+	"AAVE": true,
+	"USDP": true,
+	// Add more assets as needed
+}
+
+// isAavePoolAsset checks if a token is an Aave pool asset
+func isAavePoolAsset(symbol string) bool {
+	return aaveSupportedAssets[strings.ToUpper(symbol)]
+}
+
 // Configuration represents the application configuration
 type Configuration struct {
 	RPCEndpoints    []string             `json:"rpcEndpoints"`
@@ -973,14 +991,18 @@ func (d *DEX) CallContract(ctx context.Context, address common.Address, abi abi.
 	return d.client.CallContract(ctx, msg, nil)
 }
 
-// detectArbitrageOpportunities checks for arbitrage opportunities across DEXes
-// detectArbitrageOpportunities checks for arbitrage opportunities across DEXes
+// detectArbitrageOpportunities checks for arbitrage opportunities across DEXes and initiates flash loan arbitrage
 func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos map[string]struct {
 	version  string
 	price    *big.Float
 	reserveA *big.Int
 	reserveB *big.Int
 }, tokenA, tokenB Token, lenderPreference string) {
+	// Log input prices
+	for dexName, info := range dexInfos {
+		m.logger.Price(pairKey, dexName, info.price)
+	}
+
 	// Find lowest and highest price DEXes
 	var lowestDEX, highestDEX string
 	var lowestPrice, highestPrice *big.Float
@@ -988,6 +1010,10 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 	var lowestReserveA, lowestReserveB, highestReserveA, highestReserveB *big.Int
 
 	for dexName, info := range dexInfos {
+		if info.price == nil {
+			m.logger.Warning("Nil price for %s on %s", pairKey, dexName)
+			continue
+		}
 		if lowestPrice == nil || info.price.Cmp(lowestPrice) < 0 {
 			lowestDEX = dexName
 			lowestPrice = info.price
@@ -995,7 +1021,6 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 			lowestReserveA = info.reserveA
 			lowestReserveB = info.reserveB
 		}
-
 		if highestPrice == nil || info.price.Cmp(highestPrice) > 0 {
 			highestDEX = dexName
 			highestPrice = info.price
@@ -1005,525 +1030,384 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 		}
 	}
 
-	// Calculate price difference
-	if lowestDEX != highestDEX {
-		// Calculate price gap
-		priceGap := new(big.Float).Sub(highestPrice, lowestPrice)
+	if lowestDEX == "" || highestDEX == "" || lowestDEX == highestDEX || lowestPrice == nil || highestPrice == nil {
+		m.logger.Warning("No valid price difference for %s", pairKey)
+		return
+	}
 
-		// Calculate price gap percentage
-		priceGapPercent := new(big.Float).Quo(
-			new(big.Float).Mul(priceGap, big.NewFloat(100)),
-			lowestPrice,
-		)
+	// Calculate price gap and percentage
+	priceGap := new(big.Float).Sub(highestPrice, lowestPrice)
+	priceGapPercent := new(big.Float).Quo(
+		new(big.Float).Mul(priceGap, big.NewFloat(100)),
+		lowestPrice,
+	)
+	percentFloat, _ := priceGapPercent.Float64()
 
-		// Get minimum profit threshold in USD
-		minProfitUSD := big.NewFloat(1.0) // Default $1 USD
-		minProfitStr := m.config.MinProfit
+	if percentFloat < 0.5 {
+		m.logger.Info("Price gap too low for %s: %.2f%%", pairKey, percentFloat)
+		return
+	}
 
-		if minProfitStr != "" {
-			// If the config value is in token-specific units (like USDC wei), convert to USD
-			minProfitValue, ok := new(big.Float).SetString(minProfitStr)
-			if ok {
-				// Check if this is a stablecoin amount that needs decimal adjustment
-				// For USDC with 6 decimals, divide by 10^6
-				if strings.Contains(strings.ToLower(pairKey), "usdc") ||
-					strings.Contains(strings.ToLower(pairKey), "usdt") ||
-					strings.Contains(strings.ToLower(pairKey), "dai") {
-					decimals := 6 // Most stablecoins use 6 decimals
-					if strings.Contains(strings.ToLower(pairKey), "dai") {
-						decimals = 18 // DAI uses 18 decimals
-					}
+	// Validate and log reserves
+	reserveAFloat := new(big.Float).SetInt(lowestReserveA)
+	highestReserveAFloat := new(big.Float).SetInt(highestReserveA)
+	reserveBFloat := new(big.Float).SetInt(lowestReserveB)
+	highestReserveBFloat := new(big.Float).SetInt(highestReserveB)
 
-					divisor := new(big.Float).SetInt(new(big.Int).Exp(
-						big.NewInt(10), big.NewInt(int64(decimals)), nil,
-					))
-					minProfitUSD = new(big.Float).Quo(minProfitValue, divisor)
-				} else {
-					// Not a stablecoin pair, use as is
-					minProfitUSD = minProfitValue
-				}
-			}
-		}
+	if reserveAFloat == nil || reserveBFloat == nil || reserveAFloat.Cmp(big.NewFloat(0)) <= 0 || reserveBFloat.Cmp(big.NewFloat(0)) <= 0 {
+		m.logger.Error("Invalid reserves for %s on %s", pairKey, lowestDEX)
+		return
+	}
+	if highestReserveAFloat == nil || highestReserveBFloat == nil || highestReserveAFloat.Cmp(big.NewFloat(0)) <= 0 || highestReserveBFloat.Cmp(big.NewFloat(0)) <= 0 {
+		m.logger.Error("Invalid reserves for %s on %s", pairKey, highestDEX)
+		return
+	}
 
-		// IMPROVED: Use a more realistic gas estimate
-		gasPrice, _ := new(big.Int).SetString(m.config.GasSettings.MaxGasPrice, 10)
-		gasLimit := big.NewInt(300000) // Reduced from 500,000 to a more realistic 300,000
-		gasCostWei := new(big.Int).Mul(gasPrice, gasLimit)
+	// Convert reserves to human-readable format
+	tokenADecimalDivisor := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(tokenA.Decimals)), nil))
+	tokenBDecimalDivisor := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(tokenB.Decimals)), nil))
+	lowestReserveAHR := new(big.Float).Quo(reserveAFloat, tokenADecimalDivisor)
+	lowestReserveBHR := new(big.Float).Quo(reserveBFloat, tokenBDecimalDivisor)
+	highestReserveAHR := new(big.Float).Quo(highestReserveAFloat, tokenADecimalDivisor)
+	highestReserveBHR := new(big.Float).Quo(highestReserveBFloat, tokenBDecimalDivisor)
 
-		// Convert gas cost to ETH
-		gasCostETH := new(big.Float).Quo(
-			new(big.Float).SetInt(gasCostWei),
-			new(big.Float).SetInt(big.NewInt(1000000000000000000)), // 10^18 (wei to ETH)
-		)
+	m.logger.Info("%s on %s: ReserveA: %s %s ($%s), ReserveB: %s %s", pairKey, lowestDEX, lowestReserveAHR.Text('f', 4), tokenA.Symbol, lowestReserveAHR.Text('f', 2), lowestReserveBHR.Text('f', 4), tokenB.Symbol)
+	m.logger.Info("%s on %s: ReserveA: %s %s ($%s), ReserveB: %s %s", pairKey, highestDEX, highestReserveAHR.Text('f', 4), tokenA.Symbol, highestReserveAHR.Text('f', 2), highestReserveBHR.Text('f', 4), tokenB.Symbol)
 
-		// Use current ETH price for better accuracy
-		ethPriceInUSD := big.NewFloat(2500) // Updated from 2000 to 2500
+	// Check minimum reserve threshold
+	minReserveUSD := big.NewFloat(100)
+	var lowestReserveAUSD, highestReserveAUSD *big.Float
+	if isStablecoin(tokenA.Symbol) {
+		lowestReserveAUSD = lowestReserveAHR
+		highestReserveAUSD = highestReserveAHR
+	} else {
+		ethPriceUSD := big.NewFloat(2500) // TODO: Use Chainlink oracle
+		lowestReserveAUSD = new(big.Float).Mul(lowestReserveAHR, ethPriceUSD)
+		highestReserveAUSD = new(big.Float).Mul(highestReserveAHR, ethPriceUSD)
+	}
 
-		// Calculate gas cost in USD
-		gasCostUSD := new(big.Float).Mul(gasCostETH, ethPriceInUSD)
+	if lowestReserveAUSD.Cmp(minReserveUSD) < 0 || highestReserveAUSD.Cmp(minReserveUSD) < 0 {
+		m.logger.Info("Skipping %s: Low reserves (Lowest: $%s, Highest: $%s)", pairKey, lowestReserveAUSD.Text('f', 2), highestReserveAUSD.Text('f', 2))
+		return
+	}
 
-		// IMPROVED: Calculate optimal trade size based on price difference and reserves
-		// We'll use both sets of reserves to determine which is limiting
-		reserveAFloat := new(big.Float).SetInt(lowestReserveA)
-		highestReserveAFloat := new(big.Float).SetInt(highestReserveA)
+	// Fetch gas price
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	gasPrice, err := m.client.SuggestGasPrice(ctx)
+	if err != nil || gasPrice.Cmp(big.NewInt(20e9)) < 0 { // Fallback to 20 gwei
+		gasPrice = big.NewInt(20e9)
+		m.logger.Warning("Using fallback gas price: 20 gwei")
+	}
 
-		// Convert B reserves to floats as well - used for calculating max swap amounts
-		reserveBFloat := new(big.Float).SetInt(lowestReserveB)
-		highestReserveBFloat := new(big.Float).SetInt(highestReserveB)
+	// Estimate gas cost
+	gasLimit := uint64(400000) // Flash loan arbitrage
+	gasCostWei := new(big.Int).Mul(gasPrice, big.NewInt(int64(gasLimit)))
+	gasCostETH := new(big.Float).Quo(
+		new(big.Float).SetInt(gasCostWei),
+		new(big.Float).SetInt(big.NewInt(1e18)),
+	)
+	ethPriceUSD := big.NewFloat(2500) // TODO: Use Chainlink oracle
+	gasCostUSD := new(big.Float).Mul(gasCostETH, ethPriceUSD)
+	m.logger.Info("Estimated gas cost: $%.2f", gasCostUSD)
 
-		var tradeSizePercent *big.Float
+	// Early profitability check
+	estimatedTradeAmount := new(big.Float).Mul(reserveAFloat, big.NewFloat(0.05)) // 5% for estimation
+	estimatedTradeHR := new(big.Float).Quo(estimatedTradeAmount, tokenADecimalDivisor)
+	estimatedProfitUSD := new(big.Float).Mul(estimatedTradeHR, priceGap)
+	if estimatedProfitUSD.Cmp(gasCostUSD) < 0 {
+		m.logger.Info("Skipping %s: Estimated profit ($%s) below gas cost ($%s)", pairKey, estimatedProfitUSD.Text('f', 2), gasCostUSD.Text('f', 2))
+		return
+	}
+	m.logger.Info("Estimated profit for %s: $%s", pairKey, estimatedProfitUSD.Text('f', 2))
 
-		// Get price gap percentage as float for easier handling
-		percentFloat, _ := priceGapPercent.Float64()
+	// Minimum profit threshold (USD)
+	minProfitUSD, ok := new(big.Float).SetString(m.config.MinProfit)
+	if !ok || minProfitUSD == nil {
+		minProfitUSD = big.NewFloat(1.0) // Default $1
+		m.logger.Warning("Invalid MinProfit, using default: $1")
+	}
 
-		// Dynamically adjust trade size based on price difference
-		if percentFloat > 20 {
-			tradeSizePercent = big.NewFloat(0.02) // 2% for huge opportunities (>20%)
-		} else if percentFloat > 10 {
-			tradeSizePercent = big.NewFloat(0.01) // 1% for large opportunities (10-20%)
-		} else if percentFloat > 5 {
-			tradeSizePercent = big.NewFloat(0.005) // 0.5% for medium opportunities (5-10%)
-		} else {
-			tradeSizePercent = big.NewFloat(0.002) // 0.2% for small opportunities (<5%)
-		}
+	// Determine trade size
+	tradeSizePercent := big.NewFloat(0.05) // 5% for low reserves
+	if percentFloat > 15 {
+		tradeSizePercent = big.NewFloat(0.10) // 10% for large opportunities
+	} else if percentFloat > 5 {
+		tradeSizePercent = big.NewFloat(0.075) // 7.5% for medium opportunities
+	}
 
-		// Calculate base trade size in token A using lowest DEX's reserves
-		tradeAmountInTokenA := new(big.Float).Mul(reserveAFloat, tradeSizePercent)
+	tradeAmountInTokenA := new(big.Float).Mul(reserveAFloat, tradeSizePercent)
+	highestTradeAmountInTokenA := new(big.Float).Mul(highestReserveAFloat, tradeSizePercent)
+	if highestTradeAmountInTokenA.Cmp(tradeAmountInTokenA) < 0 {
+		tradeAmountInTokenA = highestTradeAmountInTokenA
+	}
 
-		// Also calculate a trade size based on highest DEX's reserves
-		highestTradeAmountInTokenA := new(big.Float).Mul(highestReserveAFloat, tradeSizePercent)
+	tradeAmountInTokenB := new(big.Float).Mul(reserveBFloat, tradeSizePercent)
+	highestTradeAmountInTokenB := new(big.Float).Mul(highestReserveBFloat, tradeSizePercent)
+	if highestTradeAmountInTokenB.Cmp(tradeAmountInTokenB) < 0 {
+		tradeAmountInTokenB = highestTradeAmountInTokenB
+		tradeAmountInTokenA = new(big.Float).Quo(tradeAmountInTokenB, lowestPrice)
+	}
 
-		// Take the smaller of the two to ensure the trade will work in both DEXes
-		if highestTradeAmountInTokenA.Cmp(tradeAmountInTokenA) < 0 {
-			tradeAmountInTokenA = highestTradeAmountInTokenA
-		}
+	// Cap trade size at 50% of reserves
+	maxTradePercent := big.NewFloat(0.50)
+	maxTradeAmountInTokenA := new(big.Float).Mul(reserveAFloat, maxTradePercent)
+	if tradeAmountInTokenA.Cmp(maxTradeAmountInTokenA) > 0 {
+		tradeAmountInTokenA = maxTradeAmountInTokenA
+	}
 
-		// Also check reserve B limits (useful for determining maximum swap amounts)
-		// This helps prevent situations where the token B reserves are too low for the trade
-		tradeAmountInTokenB := new(big.Float).Mul(reserveBFloat, tradeSizePercent)
-		highestTradeAmountInTokenB := new(big.Float).Mul(highestReserveBFloat, tradeSizePercent)
+	tradeAmountHumanReadable := new(big.Float).Quo(tradeAmountInTokenA, tokenADecimalDivisor)
+	minTradeAmount := new(big.Float).Quo(reserveAFloat, big.NewFloat(10)) // 10% of reserves
+	minTradeAmountHR := new(big.Float).Quo(minTradeAmount, tokenADecimalDivisor)
+	if minTradeAmountHR.Cmp(big.NewFloat(100)) > 0 {
+		minTradeAmountHR = big.NewFloat(100) // Cap at 100 USDC
+	}
+	if isStablecoin(tokenA.Symbol) && tradeAmountHumanReadable.Cmp(minTradeAmountHR) < 0 {
+		tradeAmountHumanReadable = minTradeAmountHR
+		tradeAmountInTokenA = new(big.Float).Mul(minTradeAmountHR, tokenADecimalDivisor)
+	}
+	m.logger.Info("Trade amount: %s %s", tradeAmountHumanReadable.Text('f', 4), tokenA.Symbol)
 
-		// Make sure we're not trying to swap more than available in reserve B
-		if highestTradeAmountInTokenB.Cmp(tradeAmountInTokenB) < 0 {
-			// Adjust tokenA amount based on reserveB limitations
-			tradeAmountInTokenB = highestTradeAmountInTokenB
+	// Calculate trade value in USD
+	var tradeValueUSD *big.Float
+	if isStablecoin(tokenA.Symbol) {
+		tradeValueUSD = new(big.Float).Copy(tradeAmountHumanReadable)
+	} else if isStablecoin(tokenB.Symbol) {
+		avgPrice := new(big.Float).Quo(new(big.Float).Add(lowestPrice, highestPrice), big.NewFloat(2))
+		tradeValueUSD = new(big.Float).Mul(tradeAmountHumanReadable, avgPrice)
+	} else {
+		tradeValueUSD = new(big.Float).Mul(tradeAmountHumanReadable, ethPriceUSD)
+		m.logger.Warning("Non-stablecoin pair, using ETH price estimate for USD")
+	}
+	m.logger.Info("Trade value: $%.2f", tradeValueUSD)
 
-			// Convert back to tokenA equivalent using the price ratio
-			tradeAmountInTokenA = new(big.Float).Quo(tradeAmountInTokenB, lowestPrice)
-		}
+	// Select borrow token for flash loan
+	var borrowToken Token
+	var borrowTokenAddr common.Address
+	var borrowTokenDecimals uint8
 
-		// Convert to human-readable token units by dividing by 10^decimals
-		divisor := new(big.Float).SetInt(new(big.Int).Exp(
-			big.NewInt(10), big.NewInt(int64(tokenA.Decimals)), nil,
-		))
-		tradeAmountHumanReadable := new(big.Float).Quo(tradeAmountInTokenA, divisor)
+	if isStablecoin(tokenA.Symbol) && isAavePoolAsset(tokenA.Symbol) {
+		borrowToken = tokenA
+		borrowTokenAddr = tokenA.Address
+		borrowTokenDecimals = tokenA.Decimals
+	} else if isStablecoin(tokenB.Symbol) && isAavePoolAsset(tokenB.Symbol) {
+		borrowToken = tokenB
+		borrowTokenAddr = tokenB.Address
+		borrowTokenDecimals = tokenB.Decimals
+	} else if isAavePoolAsset(tokenA.Symbol) {
+		borrowToken = tokenA
+		borrowTokenAddr = tokenA.Address
+		borrowTokenDecimals = tokenA.Decimals
+	} else if isAavePoolAsset(tokenB.Symbol) {
+		borrowToken = tokenB
+		borrowTokenAddr = tokenB.Address
+		borrowTokenDecimals = tokenB.Decimals
+	} else {
+		m.logger.Warning("No Aave-supported asset in pair %s", pairKey)
+		return
+	}
+	m.logger.Info("Selected borrow token: %s", borrowToken.Symbol)
 
-		// Calculate trade value in USD with better accuracy
-		var tradeValueUSD *big.Float
+	// Query Aave pool reserves
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-		if isStablecoin(tokenA.Symbol) {
-			// If token A is a stablecoin, its value is approximately its amount
-			tradeValueUSD = new(big.Float).Copy(tradeAmountHumanReadable)
-		} else if isStablecoin(tokenB.Symbol) {
-			// If token B is a stablecoin, multiply by the average price
-			avgPrice := new(big.Float).Add(lowestPrice, highestPrice)
-			avgPrice = new(big.Float).Quo(avgPrice, big.NewFloat(2))
-			tradeValueUSD = new(big.Float).Mul(tradeAmountHumanReadable, avgPrice)
-		} else {
-			// IMPROVED: Better estimate for non-stablecoin pairs
-			// This would ideally use a price oracle, but we'll make a more reasonable estimate
-			// Use the reserves to calculate an approximate USD value
-			// For example, if reserveB is a significant amount of ETH/WETH, we can estimate value
+	aaveABI, err := abi.JSON(strings.NewReader(AaveV3PoolABI))
+	if err != nil {
+		m.logger.Error("Failed to parse Aave ABI: %v", err)
+		return
+	}
 
-			// Check if either token might be WETH or ETH
-			isTokenAEth := strings.Contains(strings.ToLower(tokenA.Symbol), "eth")
-			isTokenBEth := strings.Contains(strings.ToLower(tokenB.Symbol), "eth")
+	input, err := aaveABI.Pack("getReserveData", borrowTokenAddr)
+	if err != nil {
+		m.logger.Error("Failed to pack getReserveData input: %v", err)
+		return
+	}
 
-			if isTokenAEth {
-				// If trading ETH, just multiply by ETH price
-				tradeValueUSD = new(big.Float).Mul(tradeAmountHumanReadable, ethPriceInUSD)
-			} else if isTokenBEth {
-				// If trading against ETH, convert to ETH value first then to USD
-				ethValue := new(big.Float).Mul(tradeAmountHumanReadable, lowestPrice)
-				tradeValueUSD = new(big.Float).Mul(ethValue, ethPriceInUSD)
-			} else {
-				// Default fallback
-				tradeValueUSD = big.NewFloat(500) // Default to a moderate value for testing
-			}
-		}
+	msg := ethereum.CallMsg{
+		To:   &m.config.LenderConfig.AavePoolAddress,
+		Data: input,
+	}
 
-		// Calculate profit per token (just the price difference)
-		profitPerToken := new(big.Float).Copy(priceGap)
+	data, err := m.client.CallContract(ctx, msg, nil)
+	if err != nil {
+		m.logger.Error("Failed to call getReserveData: %v", err)
+		return
+	}
 
-		// Calculate profit in token units - this is more accurate
-		profitInToken := new(big.Float).Mul(tradeAmountHumanReadable, new(big.Float).Quo(priceGapPercent, big.NewFloat(100)))
+	if len(data) < 9*32 {
+		m.logger.Error("Invalid getReserveData response")
+		return
+	}
 
-		// Calculate profit in USD more accurately
-		// This is the amount of tokens × price difference
-		profitInUSD := new(big.Float).Mul(tradeAmountHumanReadable, priceGap)
+	aTokenAddrBytes := data[8*32+12 : 9*32]
+	var aTokenAddr common.Address
+	copy(aTokenAddr[:], aTokenAddrBytes)
 
-		// Get raw profit before gas costs
-		rawProfitUSD := new(big.Float).Copy(profitInUSD)
+	totalSupplyABI, err := abi.JSON(strings.NewReader(`[
+		{"inputs":[],"name":"totalSupply","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
+	]`))
+	if err != nil {
+		m.logger.Error("Failed to parse totalSupply ABI: %v", err)
+		return
+	}
 
-		// Subtract gas cost for net profit
-		netProfitUSD := new(big.Float).Sub(profitInUSD, gasCostUSD)
+	supplyInput, err := totalSupplyABI.Pack("totalSupply")
+	if err != nil {
+		m.logger.Error("Failed to pack totalSupply input: %v", err)
+		return
+	}
 
-		// FLASH LOAN CALCULATION WITH AAVE POOL RESERVES CHECK
-		// Calculate optimal flash loan amount for maximum profit
-		flashLoanFeePercent := big.NewFloat(0.09) // 0.09% fee for Aave V3
+	supplyMsg := ethereum.CallMsg{
+		To:   &aTokenAddr,
+		Data: supplyInput,
+	}
 
-		// Determine which token to borrow for the flash loan (prefer stablecoins)
-		var borrowToken Token
-		var borrowTokenAddr common.Address
-		var borrowTokenDecimals uint8
+	supplyData, err := m.client.CallContract(ctx, supplyMsg, nil)
+	if err != nil || len(supplyData) < 32 {
+		m.logger.Error("Failed to get aToken totalSupply: %v", err)
+		return
+	}
 
-		if isStablecoin(tokenA.Symbol) {
-			borrowToken = tokenA
-			borrowTokenAddr = tokenA.Address
-			borrowTokenDecimals = tokenA.Decimals
-		} else if isStablecoin(tokenB.Symbol) {
-			borrowToken = tokenB
-			borrowTokenAddr = tokenB.Address
-			borrowTokenDecimals = tokenB.Decimals
-		} else {
-			// If neither is a stablecoin, prefer token with more liquidity
-			if lowestReserveA.Cmp(lowestReserveB) > 0 {
-				borrowToken = tokenA
-				borrowTokenAddr = tokenA.Address
-				borrowTokenDecimals = tokenA.Decimals
-			} else {
-				borrowToken = tokenB
-				borrowTokenAddr = tokenB.Address
-				borrowTokenDecimals = tokenB.Decimals
-			}
-		}
+	totalSupply := new(big.Int).SetBytes(supplyData[:32])
+	availableLiquidity := new(big.Int).Div(totalSupply, big.NewInt(2)) // Conservative: 50% of total supply
+	aaveLiquidityHR := new(big.Float).Quo(new(big.Float).SetInt(availableLiquidity), new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil)))
+	m.logger.Info("Aave available liquidity: %s %s", aaveLiquidityHR.Text('f', 4), borrowToken.Symbol)
 
-		// Set default Aave reserves based on the token type
-		var aaveReserves *big.Int
+	// Calculate max flash loan amount
+	maxAavePercent := big.NewFloat(0.80)
+	aaveLiquidityFloat := new(big.Float).SetInt(availableLiquidity)
+	maxFlashLoanRaw := new(big.Float).Mul(aaveLiquidityFloat, maxAavePercent)
+	aaveDecimalDivisor := new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil))
+	maxFlashLoanAmount := new(big.Float).Quo(maxFlashLoanRaw, aaveDecimalDivisor)
 
-		// Use higher defaults for stablecoins
-		if isStablecoin(borrowToken.Symbol) {
-			// 1 million units for stablecoins (generous default)
-			aaveReserves = new(big.Int).Mul(
-				big.NewInt(1000000),
-				new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil),
-			)
-			m.logger.Info("Using default reserves for %s (stablecoin): %s units",
-				borrowToken.Symbol, new(big.Float).Quo(
-					new(big.Float).SetInt(aaveReserves),
-					new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil)),
-				).Text('f', 2),
-			)
-		} else {
-			// 10k units for other tokens (conservative default)
-			aaveReserves = new(big.Int).Mul(
-				big.NewInt(10000),
-				new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil),
-			)
-			m.logger.Info("Using default reserves for %s (non-stablecoin): %s units",
-				borrowToken.Symbol, new(big.Float).Quo(
-					new(big.Float).SetInt(aaveReserves),
-					new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil)),
-				).Text('f', 2),
-			)
-		}
+	// Calculate DEX-limited flash loan size
+	flashLoanPercent := big.NewFloat(0.20) // 20% for low-liquidity pools
+	flashLoanAmountTokenA := new(big.Float).Mul(reserveAFloat, flashLoanPercent)
+	flashLoanAmountTokenB := new(big.Float).Mul(reserveBFloat, flashLoanPercent)
 
-		// Update the Aave pool address to use the correct Sepolia address
-		aavePoolAddress := m.config.LenderConfig.AavePoolAddress
-		m.logger.Info("Using Aave Pool address for Sepolia: %s", aavePoolAddress.String())
+	highestFlashLoanAmountTokenB := new(big.Float).Mul(highestReserveBFloat, flashLoanPercent)
+	if highestFlashLoanAmountTokenB.Cmp(flashLoanAmountTokenB) < 0 {
+		flashLoanAmountTokenB = highestFlashLoanAmountTokenB
+		flashLoanAmountTokenA = new(big.Float).Quo(flashLoanAmountTokenB, lowestPrice)
+	}
 
-		// Check if in simulation mode
-		if os.Getenv("SIMULATION_MODE") != "1" {
-			// Create a context with timeout
-			ctxTimeout, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
+	flashLoanHumanReadableA := new(big.Float).Quo(flashLoanAmountTokenA, tokenADecimalDivisor)
+	if isStablecoin(tokenA.Symbol) && flashLoanHumanReadableA.Cmp(minTradeAmountHR) < 0 {
+		flashLoanHumanReadableA = minTradeAmountHR
+		flashLoanAmountTokenA = new(big.Float).Mul(minTradeAmountHR, tokenADecimalDivisor)
+	}
 
-			// Try the simpler approach - check if the token exists in Aave using normalized income
-			simpleABI := `[
-        {"inputs":[{"internalType":"address","name":"asset","type":"address"}],"name":"getReserveNormalizedIncome","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
-    ]`
+	// Convert to borrowed token terms
+	var flashLoanHumanReadable *big.Float
+	if borrowToken.Symbol == tokenA.Symbol {
+		flashLoanHumanReadable = flashLoanHumanReadableA
+	} else {
+		flashLoanHumanReadable = new(big.Float).Mul(flashLoanHumanReadableA, lowestPrice)
+	}
 
-			aaveSimpleABI, abiErr := abi.JSON(strings.NewReader(simpleABI))
-			if abiErr == nil {
-				input, packErr := aaveSimpleABI.Pack("getReserveNormalizedIncome", borrowTokenAddr)
-				if packErr == nil {
-					msg := ethereum.CallMsg{
-						To:   &aavePoolAddress,
-						Data: input,
-					}
-
-					data, callErr := m.client.CallContract(ctxTimeout, msg, nil)
-					if callErr == nil && len(data) > 0 {
-						// If we get a valid response, the token exists in Aave
-						var normalizedIncome *big.Int
-						if err := aaveSimpleABI.UnpackIntoInterface(&normalizedIncome, "getReserveNormalizedIncome", data); err == nil {
-							if normalizedIncome != nil && normalizedIncome.Cmp(big.NewInt(0)) > 0 {
-								m.logger.Success("Token %s is available in Aave with normalized income: %s",
-									borrowToken.Symbol, normalizedIncome.String())
-
-								// Try to get reserve data to extract aToken address
-								dataABI := `[
-                            {"inputs":[{"internalType":"address","name":"asset","type":"address"}],"name":"getReserveData","outputs":[{"components":[{"components":[{"internalType":"uint256","name":"data","type":"uint256"}],"internalType":"struct DataTypes.ReserveConfigurationMap","name":"configuration","type":"tuple"},{"internalType":"uint128","name":"liquidityIndex","type":"uint128"},{"internalType":"uint128","name":"currentLiquidityRate","type":"uint128"},{"internalType":"uint128","name":"variableBorrowIndex","type":"uint128"},{"internalType":"uint128","name":"currentVariableBorrowRate","type":"uint128"},{"internalType":"uint128","name":"currentStableBorrowRate","type":"uint128"},{"internalType":"uint40","name":"lastUpdateTimestamp","type":"uint40"},{"internalType":"uint16","name":"id","type":"uint16"},{"internalType":"address","name":"aTokenAddress","type":"address"},{"internalType":"address","name":"stableDebtTokenAddress","type":"address"},{"internalType":"address","name":"variableDebtTokenAddress","type":"address"},{"internalType":"address","name":"interestRateStrategyAddress","type":"address"},{"internalType":"uint128","name":"accruedToTreasury","type":"uint128"},{"internalType":"uint128","name":"unbacked","type":"uint128"},{"internalType":"uint128","name":"isolationModeTotalDebt","type":"uint128"}],"internalType":"struct DataTypes.ReserveData","name":"","type":"tuple"}],"stateMutability":"view","type":"function"}
-                        ]`
-
-								reserveDataABI, _ := abi.JSON(strings.NewReader(dataABI))
-								input, _ := reserveDataABI.Pack("getReserveData", borrowTokenAddr)
-
-								msg := ethereum.CallMsg{
-									To:   &aavePoolAddress,
-									Data: input,
-								}
-
-								data, callErr := m.client.CallContract(ctxTimeout, msg, nil)
-								if callErr == nil && len(data) > 0 {
-									// Data exists, but we'll extract specific fields directly rather than trying
-									// to unpack the complex struct which might not match our Go struct exactly
-
-									// Get aToken address - in Aave V3, it's the 9th field in the struct
-									// It starts at offset 8*32 bytes from beginning of data (after the first 8 fields)
-									if len(data) >= 9*32 {
-										// Extract aToken address (address is 20 bytes, at the end of a 32 byte slot)
-										aTokenAddrBytes := data[8*32+12 : 9*32] // last 20 bytes of the slot
-										var aTokenAddr common.Address
-										copy(aTokenAddr[:], aTokenAddrBytes)
-
-										if aTokenAddr != (common.Address{}) {
-											m.logger.Info("Found aToken address for %s: %s",
-												borrowToken.Symbol, aTokenAddr.String())
-
-											// Query the total supply of aTokens as a proxy for liquidity
-											totalSupplyABI := `[
-                                        {"inputs":[],"name":"totalSupply","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
-                                    ]`
-
-											supplyABI, _ := abi.JSON(strings.NewReader(totalSupplyABI))
-											supplyInput, _ := supplyABI.Pack("totalSupply")
-
-											supplyMsg := ethereum.CallMsg{
-												To:   &aTokenAddr,
-												Data: supplyInput,
-											}
-
-											supplyData, supplyErr := m.client.CallContract(ctxTimeout, supplyMsg, nil)
-											if supplyErr == nil && len(supplyData) >= 32 {
-												totalSupply := new(big.Int).SetBytes(supplyData[:32])
-
-												if totalSupply.Cmp(big.NewInt(0)) > 0 {
-													// Use 50% of total supply as available liquidity (conservative)
-													aaveReserves = new(big.Int).Div(totalSupply, big.NewInt(2))
-
-													m.logger.Success("Found total aToken supply for %s: %s, using 50%% as available: %s",
-														borrowToken.Symbol,
-														new(big.Float).Quo(
-															new(big.Float).SetInt(totalSupply),
-															new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil)),
-														).Text('f', 2),
-														new(big.Float).Quo(
-															new(big.Float).SetInt(aaveReserves),
-															new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil)),
-														).Text('f', 2),
-													)
-												}
-											} else {
-												m.logger.Warning("Failed to get aToken totalSupply: %v", supplyErr)
-											}
-										}
-									}
-								} else {
-									m.logger.Warning("Failed to get reserve data: %v", callErr)
-								}
-							}
-						}
-					} else {
-						if callErr != nil {
-							m.logger.Warning("Call to getReserveNormalizedIncome failed: %v", callErr)
-						} else {
-							m.logger.Warning("Empty response from getReserveNormalizedIncome")
-						}
-					}
-				}
-			}
-		}
-
-		// Calculate maximum flash loan amount from Aave reserves (80% of available liquidity)
-		maxAavePercent := big.NewFloat(0.80)
-		aaveReservesFloat := new(big.Float).SetInt(aaveReserves)
-		maxFlashLoanRaw := new(big.Float).Mul(aaveReservesFloat, maxAavePercent)
-
-		// Convert to human-readable amount by dividing by 10^decimals
-		aaveDecimalDivisor := new(big.Float).SetInt(new(big.Int).Exp(
-			big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil,
-		))
-		maxAaveFlashLoanAmount := new(big.Float).Quo(maxFlashLoanRaw, aaveDecimalDivisor)
-
-		// Log available Aave reserves for debugging
-		m.logger.Info("Max borrowable from Aave for %s: %s",
-			borrowToken.Symbol, maxAaveFlashLoanAmount.Text('f', 4))
-
-		// Calculate DEX-limited flash loan size
-		flashLoanPercent := big.NewFloat(0.05) // 5% of reserves by default
-		flashLoanAmountTokenA := new(big.Float).Mul(reserveAFloat, flashLoanPercent)
-		flashLoanAmountTokenB := new(big.Float).Mul(reserveBFloat, flashLoanPercent)
-
-		// Adjust based on DEX limitations
-		highestFlashLoanAmountTokenB := new(big.Float).Mul(highestReserveBFloat, flashLoanPercent)
-		if highestFlashLoanAmountTokenB.Cmp(flashLoanAmountTokenB) < 0 {
-			flashLoanAmountTokenB = highestFlashLoanAmountTokenB
-			flashLoanAmountTokenA = new(big.Float).Quo(flashLoanAmountTokenB, lowestPrice)
-		}
-
-		// Convert to human-readable tokens
-		tokenADecimalDivisor := new(big.Float).SetInt(new(big.Int).Exp(
-			big.NewInt(10), big.NewInt(int64(tokenA.Decimals)), nil,
-		))
-		flashLoanHumanReadableA := new(big.Float).Quo(flashLoanAmountTokenA, tokenADecimalDivisor)
-
-		// Convert to borrowed token terms if necessary
-		var flashLoanHumanReadable *big.Float
+	// Take the smaller of DEX and Aave limits
+	if flashLoanHumanReadable.Cmp(maxFlashLoanAmount) > 0 {
+		m.logger.Info("Flash loan limited by Aave: %s %s", maxFlashLoanAmount.Text('f', 4), borrowToken.Symbol)
+		flashLoanHumanReadable = maxFlashLoanAmount
 		if borrowToken.Symbol == tokenA.Symbol {
-			flashLoanHumanReadable = flashLoanHumanReadableA
-		} else {
-			// Convert from token A to token B using price
-			flashLoanHumanReadable = new(big.Float).Mul(flashLoanHumanReadableA, lowestPrice)
+			tradeAmountInTokenA = new(big.Float).Mul(minTradeAmountHR, tokenADecimalDivisor)
 		}
+	}
+	m.logger.Info("Flash loan amount: %s %s", flashLoanHumanReadable.Text('f', 4), borrowToken.Symbol)
 
-		// Take the smaller of DEX-limited and Aave-limited amounts
-		if flashLoanHumanReadable.Cmp(maxAaveFlashLoanAmount) > 0 {
-			m.logger.Info("Flash loan amount limited by Aave reserves: %s %s available",
-				maxAaveFlashLoanAmount.Text('f', 4), borrowToken.Symbol)
-			flashLoanHumanReadable = maxAaveFlashLoanAmount
+	// Calculate flash loan fee and profit
+	flashLoanFeePercent := big.NewFloat(0.09) // Aave V3 fee
+	flashLoanFee := new(big.Float).Mul(
+		flashLoanHumanReadable,
+		new(big.Float).Quo(flashLoanFeePercent, big.NewFloat(100)),
+	)
+	flashLoanRawProfit := new(big.Float).Mul(flashLoanHumanReadableA, priceGap)
+	flashLoanProfitAfterFee := new(big.Float).Sub(flashLoanRawProfit, flashLoanFee)
+	flashLoanNetProfit := new(big.Float).Sub(flashLoanProfitAfterFee, gasCostUSD)
 
-			// If we're borrowing token B but calculated in terms of token A, convert back
-			if borrowToken.Symbol == tokenB.Symbol {
-				// Convert from token B back to token A (for consistent usage later)
-				flashLoanHumanReadableA = new(big.Float).Quo(flashLoanHumanReadable, lowestPrice)
-			} else {
-				flashLoanHumanReadableA = flashLoanHumanReadable
-			}
-		}
+	flashLoanProfitUSD := flashLoanNetProfit
+	if !isStablecoin(borrowToken.Symbol) {
+		avgPrice := new(big.Float).Quo(new(big.Float).Add(lowestPrice, highestPrice), big.NewFloat(2))
+		flashLoanProfitUSD = new(big.Float).Mul(flashLoanNetProfit, avgPrice)
+	}
 
-		// Calculate flash loan fee
-		flashLoanFee := new(big.Float).Mul(
-			flashLoanHumanReadable,
-			new(big.Float).Quo(flashLoanFeePercent, big.NewFloat(100)),
-		)
+	var flashLoanValueUSD *big.Float
+	if isStablecoin(tokenA.Symbol) {
+		flashLoanValueUSD = new(big.Float).Copy(flashLoanHumanReadableA)
+	} else {
+		flashLoanValueUSD = new(big.Float).Mul(flashLoanHumanReadableA, new(big.Float).Quo(new(big.Float).Add(lowestPrice, highestPrice), big.NewFloat(2)))
+	}
+	new(big.Float).Mul(flashLoanHumanReadableA, new(big.Float).Quo(new(big.Float).Add(lowestPrice, highestPrice), big.NewFloat(2)))
 
-		// Calculate flash loan profit
-		flashLoanProfitPerToken := new(big.Float).Copy(profitPerToken)
-		flashLoanRawProfit := new(big.Float).Mul(flashLoanHumanReadable, flashLoanProfitPerToken)
+	// Calculate regular arbitrage profit
+	profitInToken := new(big.Float).Mul(tradeAmountHumanReadable, new(big.Float).Quo(priceGapPercent, big.NewFloat(100)))
+	profitInUSD := new(big.Float).Mul(tradeAmountHumanReadable, priceGap)
+	netProfitUSD := new(big.Float).Sub(profitInUSD, gasCostUSD)
 
-		// Subtract flash loan fee
-		flashLoanProfitAfterFee := new(big.Float).Sub(flashLoanRawProfit, flashLoanFee)
+	// Determine viability
+	dynamicMinProfit := new(big.Float).Mul(gasCostUSD, big.NewFloat(1.2)) // 20% above gas
+	dynamicMinProfit = new(big.Float).Add(dynamicMinProfit, big.NewFloat(1))
+	if dynamicMinProfit.Cmp(minProfitUSD) < 0 {
+		dynamicMinProfit = minProfitUSD
+	}
 
-		// Subtract gas costs
-		flashLoanNetProfit := new(big.Float).Sub(flashLoanProfitAfterFee, gasCostUSD)
+	isViable := netProfitUSD.Cmp(dynamicMinProfit) > 0 && percentFloat >= 0.5
+	isFlashLoanViable := flashLoanNetProfit.Cmp(dynamicMinProfit) > 0 && percentFloat >= 2.0
+	if percentFloat >= 10.0 && flashLoanNetProfit.Cmp(big.NewFloat(0)) > 0 {
+		isFlashLoanViable = true
+	}
+	if percentFloat >= 5.0 && netProfitUSD.Cmp(big.NewFloat(0)) > 0 {
+		isViable = true
+	}
 
-		// Calculate flash loan profit in USD
-		flashLoanProfitUSD := flashLoanNetProfit
+	// Create and log opportunity
+	opportunity := &ArbitrageOpportunity{
+		Timestamp:          time.Now(),
+		PairKey:            pairKey,
+		BuyDEX:             lowestDEX,
+		SellDEX:            highestDEX,
+		BuyDEXVersion:      lowestVersion,
+		SellDEXVersion:     highestVersion,
+		BuyPrice:           lowestPrice,
+		SellPrice:          highestPrice,
+		PriceGap:           priceGap,
+		ProfitPercent:      priceGapPercent,
+		GasCost:            gasCostUSD,
+		EstimatedProfit:    netProfitUSD,
+		ProfitInUSD:        profitInUSD,
+		ProfitInToken:      profitInToken,
+		TradeAmountUSD:     tradeValueUSD,
+		TradeAmountToken:   tradeAmountHumanReadable,
+		IsViable:           isViable,
+		LenderUsed:         getLenderForPair(m.config, lenderPreference),
+		ReserveA:           lowestReserveA,
+		ReserveB:           lowestReserveB,
+		RecommendedAmount:  tradeAmountHumanReadable,
+		FlashLoanAmount:    flashLoanHumanReadableA,
+		FlashLoanProfitUSD: flashLoanProfitUSD,
+		FlashLoanValueUSD:  flashLoanValueUSD,
+		IsFlashLoanViable:  isFlashLoanViable,
+	}
 
-		// Convert to USD if needed
-		if !isStablecoin(borrowToken.Symbol) {
-			// If the asset isn't a stablecoin, multiply by average price to get USD value
-			avgPrice := new(big.Float).Add(lowestPrice, highestPrice)
-			avgPrice = new(big.Float).Quo(avgPrice, big.NewFloat(2))
-			flashLoanProfitUSD = new(big.Float).Mul(flashLoanNetProfit, avgPrice)
-		}
+	m.logger.Opportunity(opportunity)
+	m.opportunityMu.Lock()
+	m.opportunities = append(m.opportunities, opportunity)
+	m.opportunityMu.Unlock()
 
-		// Calculate flash loan trade value in USD
-		var flashLoanValueUSD *big.Float
-
-		if isStablecoin(tokenA.Symbol) {
-			flashLoanValueUSD = new(big.Float).Copy(flashLoanHumanReadableA)
-		} else if isStablecoin(tokenB.Symbol) {
-			avgPrice := new(big.Float).Add(lowestPrice, highestPrice)
-			avgPrice = new(big.Float).Quo(avgPrice, big.NewFloat(2))
-			flashLoanValueUSD = new(big.Float).Mul(flashLoanHumanReadableA, avgPrice)
-		} else {
-			// Use same logic as regular trade, but with flash loan amount
-			isTokenAEth := strings.Contains(strings.ToLower(tokenA.Symbol), "eth")
-			isTokenBEth := strings.Contains(strings.ToLower(tokenB.Symbol), "eth")
-
-			if isTokenAEth {
-				flashLoanValueUSD = new(big.Float).Mul(flashLoanHumanReadableA, ethPriceInUSD)
-			} else if isTokenBEth {
-				ethValue := new(big.Float).Mul(flashLoanHumanReadableA, lowestPrice)
-				flashLoanValueUSD = new(big.Float).Mul(ethValue, ethPriceInUSD)
-			} else {
-				// Default estimate
-				flashLoanValueUSD = big.NewFloat(2000) // Higher value for flash loan
-			}
-		}
-
-		// Get dynamic profit threshold based on gas costs
-		dynamicMinProfit := new(big.Float).Mul(gasCostUSD, big.NewFloat(1.2))    // 20% above gas
-		dynamicMinProfit = new(big.Float).Add(dynamicMinProfit, big.NewFloat(1)) // plus $1 base profit
-
-		// Don't go below configured minimum
-		if dynamicMinProfit.Cmp(minProfitUSD) < 0 {
-			dynamicMinProfit = minProfitUSD
-		}
-
-		// Check both normal trade and flash loan viability
-		isViable := netProfitUSD.Cmp(dynamicMinProfit) > 0 && percentFloat >= 0.5
-		isFlashLoanViable := flashLoanNetProfit.Cmp(dynamicMinProfit) > 0 && percentFloat >= 0.5
-
-		// High percentage opportunities with positive profit are viable even with lower absolute profit
-		if percentFloat >= 5.0 && netProfitUSD.Cmp(big.NewFloat(0)) > 0 {
-			isViable = true
-		}
-
-		if percentFloat >= 3.0 && flashLoanNetProfit.Cmp(big.NewFloat(0)) > 0 {
-			isFlashLoanViable = true
-		}
-
-		// Create opportunity with proper scaling
-		opportunity := &ArbitrageOpportunity{
-			Timestamp:         time.Now(),
-			PairKey:           pairKey,
-			BuyDEX:            lowestDEX,
-			SellDEX:           highestDEX,
-			BuyDEXVersion:     lowestVersion,
-			SellDEXVersion:    highestVersion,
-			BuyPrice:          lowestPrice,
-			SellPrice:         highestPrice,
-			PriceGap:          priceGap,
-			ProfitPercent:     priceGapPercent,
-			GasCost:           gasCostUSD,
-			EstimatedProfit:   netProfitUSD,
-			ProfitInUSD:       rawProfitUSD,
-			ProfitInToken:     profitInToken,
-			TradeAmountUSD:    tradeValueUSD,
-			TradeAmountToken:  tradeAmountHumanReadable,
-			IsViable:          isViable,
-			LenderUsed:        getLenderForPair(m.config, lenderPreference),
-			ReserveA:          lowestReserveA,
-			ReserveB:          lowestReserveB,
-			RecommendedAmount: tradeAmountHumanReadable,
-
-			// Add flash loan information to the opportunity
-			FlashLoanAmount:    flashLoanHumanReadableA,
-			FlashLoanProfitUSD: flashLoanProfitUSD,
-			FlashLoanValueUSD:  flashLoanValueUSD,
-			IsFlashLoanViable:  isFlashLoanViable,
-		}
-
-		// Log opportunity with the improved logger
-		m.logOpportunity(opportunity)
-
-		// Store opportunity
-		m.opportunityMu.Lock()
-		m.opportunities = append(m.opportunities, opportunity)
-		m.opportunityMu.Unlock()
-
-		// Send viable opportunities to the executor
-		if opportunity.IsViable || opportunity.IsFlashLoanViable {
-			// Create context with timeout for execution
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-
-			// Execute the opportunity (this will simulate or execute based on configuration)
-			go m.executor.ExecuteArbitrageOpportunity(ctx, opportunity)
-		}
+	// Execute arbitrage if viable
+	if isFlashLoanViable {
+		m.logger.Success("Initiating flash loan arbitrage for %s: $%.2f profit", pairKey, flashLoanProfitUSD)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		go m.executor.ExecuteArbitrageOpportunity(ctx, opportunity)
+	} else if isViable {
+		m.logger.Success("Initiating regular arbitrage for %s: $%.2f profit", pairKey, netProfitUSD)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		go m.executor.ExecuteArbitrageOpportunity(ctx, opportunity)
+	} else {
+		m.logger.Info("Opportunity not viable for %s: FlashLoan=$%.2f, Regular=$%.2f", pairKey, flashLoanProfitUSD, netProfitUSD)
 	}
 }
 
