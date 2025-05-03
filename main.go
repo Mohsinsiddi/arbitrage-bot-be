@@ -974,6 +974,7 @@ func (d *DEX) CallContract(ctx context.Context, address common.Address, abi abi.
 }
 
 // detectArbitrageOpportunities checks for arbitrage opportunities across DEXes
+// detectArbitrageOpportunities checks for arbitrage opportunities across DEXes
 func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos map[string]struct {
 	version  string
 	price    *big.Float
@@ -1151,13 +1152,13 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 			}
 		}
 
-		// IMPROVED: Calculate profit per token (just the price difference)
+		// Calculate profit per token (just the price difference)
 		profitPerToken := new(big.Float).Copy(priceGap)
 
 		// Calculate profit in token units - this is more accurate
 		profitInToken := new(big.Float).Mul(tradeAmountHumanReadable, new(big.Float).Quo(priceGapPercent, big.NewFloat(100)))
 
-		// IMPROVED: Calculate profit in USD more accurately
+		// Calculate profit in USD more accurately
 		// This is the amount of tokens × price difference
 		profitInUSD := new(big.Float).Mul(tradeAmountHumanReadable, priceGap)
 
@@ -1167,32 +1168,239 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 		// Subtract gas cost for net profit
 		netProfitUSD := new(big.Float).Sub(profitInUSD, gasCostUSD)
 
-		// FLASH LOAN CALCULATION
+		// FLASH LOAN CALCULATION WITH AAVE POOL RESERVES CHECK
 		// Calculate optimal flash loan amount for maximum profit
-		flashLoanFeePercent := big.NewFloat(0.09) // 0.09% fee for Aave V2
+		flashLoanFeePercent := big.NewFloat(0.09) // 0.09% fee for Aave V3
 
-		// Calculate maximum possible trade size based on DEX reserves
-		// For optimal flash loan, we need to consider:
-		// 1. DEX slippage as size increases
-		// 2. Flash loan fees
-		// 3. Gas costs
+		// Determine which token to borrow for the flash loan (prefer stablecoins)
+		var borrowToken Token
+		var borrowTokenAddr common.Address
+		var borrowTokenDecimals uint8
 
-		// A simplified approach is to estimate using a larger percentage of reserves
-		flashLoanPercent := big.NewFloat(0.05) // Try with 5% of reserves
+		if isStablecoin(tokenA.Symbol) {
+			borrowToken = tokenA
+			borrowTokenAddr = tokenA.Address
+			borrowTokenDecimals = tokenA.Decimals
+		} else if isStablecoin(tokenB.Symbol) {
+			borrowToken = tokenB
+			borrowTokenAddr = tokenB.Address
+			borrowTokenDecimals = tokenB.Decimals
+		} else {
+			// If neither is a stablecoin, prefer token with more liquidity
+			if lowestReserveA.Cmp(lowestReserveB) > 0 {
+				borrowToken = tokenA
+				borrowTokenAddr = tokenA.Address
+				borrowTokenDecimals = tokenA.Decimals
+			} else {
+				borrowToken = tokenB
+				borrowTokenAddr = tokenB.Address
+				borrowTokenDecimals = tokenB.Decimals
+			}
+		}
+
+		// Set default Aave reserves based on the token type
+		var aaveReserves *big.Int
+
+		// Use higher defaults for stablecoins
+		if isStablecoin(borrowToken.Symbol) {
+			// 1 million units for stablecoins (generous default)
+			aaveReserves = new(big.Int).Mul(
+				big.NewInt(1000000),
+				new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil),
+			)
+			m.logger.Info("Using default reserves for %s (stablecoin): %s units",
+				borrowToken.Symbol, new(big.Float).Quo(
+					new(big.Float).SetInt(aaveReserves),
+					new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil)),
+				).Text('f', 2),
+			)
+		} else {
+			// 10k units for other tokens (conservative default)
+			aaveReserves = new(big.Int).Mul(
+				big.NewInt(10000),
+				new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil),
+			)
+			m.logger.Info("Using default reserves for %s (non-stablecoin): %s units",
+				borrowToken.Symbol, new(big.Float).Quo(
+					new(big.Float).SetInt(aaveReserves),
+					new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil)),
+				).Text('f', 2),
+			)
+		}
+
+		// Update the Aave pool address to use the correct Sepolia address
+		aavePoolAddress := m.config.LenderConfig.AavePoolAddress
+		m.logger.Info("Using Aave Pool address for Sepolia: %s", aavePoolAddress.String())
+
+		// Check if in simulation mode
+		if os.Getenv("SIMULATION_MODE") != "1" {
+			// Create a context with timeout
+			ctxTimeout, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			// Try the simpler approach - check if the token exists in Aave using normalized income
+			simpleABI := `[
+        {"inputs":[{"internalType":"address","name":"asset","type":"address"}],"name":"getReserveNormalizedIncome","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
+    ]`
+
+			aaveSimpleABI, abiErr := abi.JSON(strings.NewReader(simpleABI))
+			if abiErr == nil {
+				input, packErr := aaveSimpleABI.Pack("getReserveNormalizedIncome", borrowTokenAddr)
+				if packErr == nil {
+					msg := ethereum.CallMsg{
+						To:   &aavePoolAddress,
+						Data: input,
+					}
+
+					data, callErr := m.client.CallContract(ctxTimeout, msg, nil)
+					if callErr == nil && len(data) > 0 {
+						// If we get a valid response, the token exists in Aave
+						var normalizedIncome *big.Int
+						if err := aaveSimpleABI.UnpackIntoInterface(&normalizedIncome, "getReserveNormalizedIncome", data); err == nil {
+							if normalizedIncome != nil && normalizedIncome.Cmp(big.NewInt(0)) > 0 {
+								m.logger.Success("Token %s is available in Aave with normalized income: %s",
+									borrowToken.Symbol, normalizedIncome.String())
+
+								// Try to get reserve data to extract aToken address
+								dataABI := `[
+                            {"inputs":[{"internalType":"address","name":"asset","type":"address"}],"name":"getReserveData","outputs":[{"components":[{"components":[{"internalType":"uint256","name":"data","type":"uint256"}],"internalType":"struct DataTypes.ReserveConfigurationMap","name":"configuration","type":"tuple"},{"internalType":"uint128","name":"liquidityIndex","type":"uint128"},{"internalType":"uint128","name":"currentLiquidityRate","type":"uint128"},{"internalType":"uint128","name":"variableBorrowIndex","type":"uint128"},{"internalType":"uint128","name":"currentVariableBorrowRate","type":"uint128"},{"internalType":"uint128","name":"currentStableBorrowRate","type":"uint128"},{"internalType":"uint40","name":"lastUpdateTimestamp","type":"uint40"},{"internalType":"uint16","name":"id","type":"uint16"},{"internalType":"address","name":"aTokenAddress","type":"address"},{"internalType":"address","name":"stableDebtTokenAddress","type":"address"},{"internalType":"address","name":"variableDebtTokenAddress","type":"address"},{"internalType":"address","name":"interestRateStrategyAddress","type":"address"},{"internalType":"uint128","name":"accruedToTreasury","type":"uint128"},{"internalType":"uint128","name":"unbacked","type":"uint128"},{"internalType":"uint128","name":"isolationModeTotalDebt","type":"uint128"}],"internalType":"struct DataTypes.ReserveData","name":"","type":"tuple"}],"stateMutability":"view","type":"function"}
+                        ]`
+
+								reserveDataABI, _ := abi.JSON(strings.NewReader(dataABI))
+								input, _ := reserveDataABI.Pack("getReserveData", borrowTokenAddr)
+
+								msg := ethereum.CallMsg{
+									To:   &aavePoolAddress,
+									Data: input,
+								}
+
+								data, callErr := m.client.CallContract(ctxTimeout, msg, nil)
+								if callErr == nil && len(data) > 0 {
+									// Data exists, but we'll extract specific fields directly rather than trying
+									// to unpack the complex struct which might not match our Go struct exactly
+
+									// Get aToken address - in Aave V3, it's the 9th field in the struct
+									// It starts at offset 8*32 bytes from beginning of data (after the first 8 fields)
+									if len(data) >= 9*32 {
+										// Extract aToken address (address is 20 bytes, at the end of a 32 byte slot)
+										aTokenAddrBytes := data[8*32+12 : 9*32] // last 20 bytes of the slot
+										var aTokenAddr common.Address
+										copy(aTokenAddr[:], aTokenAddrBytes)
+
+										if aTokenAddr != (common.Address{}) {
+											m.logger.Info("Found aToken address for %s: %s",
+												borrowToken.Symbol, aTokenAddr.String())
+
+											// Query the total supply of aTokens as a proxy for liquidity
+											totalSupplyABI := `[
+                                        {"inputs":[],"name":"totalSupply","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
+                                    ]`
+
+											supplyABI, _ := abi.JSON(strings.NewReader(totalSupplyABI))
+											supplyInput, _ := supplyABI.Pack("totalSupply")
+
+											supplyMsg := ethereum.CallMsg{
+												To:   &aTokenAddr,
+												Data: supplyInput,
+											}
+
+											supplyData, supplyErr := m.client.CallContract(ctxTimeout, supplyMsg, nil)
+											if supplyErr == nil && len(supplyData) >= 32 {
+												totalSupply := new(big.Int).SetBytes(supplyData[:32])
+
+												if totalSupply.Cmp(big.NewInt(0)) > 0 {
+													// Use 50% of total supply as available liquidity (conservative)
+													aaveReserves = new(big.Int).Div(totalSupply, big.NewInt(2))
+
+													m.logger.Success("Found total aToken supply for %s: %s, using 50%% as available: %s",
+														borrowToken.Symbol,
+														new(big.Float).Quo(
+															new(big.Float).SetInt(totalSupply),
+															new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil)),
+														).Text('f', 2),
+														new(big.Float).Quo(
+															new(big.Float).SetInt(aaveReserves),
+															new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil)),
+														).Text('f', 2),
+													)
+												}
+											} else {
+												m.logger.Warning("Failed to get aToken totalSupply: %v", supplyErr)
+											}
+										}
+									}
+								} else {
+									m.logger.Warning("Failed to get reserve data: %v", callErr)
+								}
+							}
+						}
+					} else {
+						if callErr != nil {
+							m.logger.Warning("Call to getReserveNormalizedIncome failed: %v", callErr)
+						} else {
+							m.logger.Warning("Empty response from getReserveNormalizedIncome")
+						}
+					}
+				}
+			}
+		}
+
+		// Calculate maximum flash loan amount from Aave reserves (80% of available liquidity)
+		maxAavePercent := big.NewFloat(0.80)
+		aaveReservesFloat := new(big.Float).SetInt(aaveReserves)
+		maxFlashLoanRaw := new(big.Float).Mul(aaveReservesFloat, maxAavePercent)
+
+		// Convert to human-readable amount by dividing by 10^decimals
+		aaveDecimalDivisor := new(big.Float).SetInt(new(big.Int).Exp(
+			big.NewInt(10), big.NewInt(int64(borrowTokenDecimals)), nil,
+		))
+		maxAaveFlashLoanAmount := new(big.Float).Quo(maxFlashLoanRaw, aaveDecimalDivisor)
+
+		// Log available Aave reserves for debugging
+		m.logger.Info("Max borrowable from Aave for %s: %s",
+			borrowToken.Symbol, maxAaveFlashLoanAmount.Text('f', 4))
+
+		// Calculate DEX-limited flash loan size
+		flashLoanPercent := big.NewFloat(0.05) // 5% of reserves by default
 		flashLoanAmountTokenA := new(big.Float).Mul(reserveAFloat, flashLoanPercent)
-
-		// Make sure we're not exceeding reserve B limitations
 		flashLoanAmountTokenB := new(big.Float).Mul(reserveBFloat, flashLoanPercent)
-		highestFlashLoanAmountTokenB := new(big.Float).Mul(highestReserveBFloat, flashLoanPercent)
 
-		// Use the more limiting factor
+		// Adjust based on DEX limitations
+		highestFlashLoanAmountTokenB := new(big.Float).Mul(highestReserveBFloat, flashLoanPercent)
 		if highestFlashLoanAmountTokenB.Cmp(flashLoanAmountTokenB) < 0 {
 			flashLoanAmountTokenB = highestFlashLoanAmountTokenB
 			flashLoanAmountTokenA = new(big.Float).Quo(flashLoanAmountTokenB, lowestPrice)
 		}
 
-		// Convert to human-readable amount
-		flashLoanHumanReadable := new(big.Float).Quo(flashLoanAmountTokenA, divisor)
+		// Convert to human-readable tokens
+		tokenADecimalDivisor := new(big.Float).SetInt(new(big.Int).Exp(
+			big.NewInt(10), big.NewInt(int64(tokenA.Decimals)), nil,
+		))
+		flashLoanHumanReadableA := new(big.Float).Quo(flashLoanAmountTokenA, tokenADecimalDivisor)
+
+		// Convert to borrowed token terms if necessary
+		var flashLoanHumanReadable *big.Float
+		if borrowToken.Symbol == tokenA.Symbol {
+			flashLoanHumanReadable = flashLoanHumanReadableA
+		} else {
+			// Convert from token A to token B using price
+			flashLoanHumanReadable = new(big.Float).Mul(flashLoanHumanReadableA, lowestPrice)
+		}
+
+		// Take the smaller of DEX-limited and Aave-limited amounts
+		if flashLoanHumanReadable.Cmp(maxAaveFlashLoanAmount) > 0 {
+			m.logger.Info("Flash loan amount limited by Aave reserves: %s %s available",
+				maxAaveFlashLoanAmount.Text('f', 4), borrowToken.Symbol)
+			flashLoanHumanReadable = maxAaveFlashLoanAmount
+
+			// If we're borrowing token B but calculated in terms of token A, convert back
+			if borrowToken.Symbol == tokenB.Symbol {
+				// Convert from token B back to token A (for consistent usage later)
+				flashLoanHumanReadableA = new(big.Float).Quo(flashLoanHumanReadable, lowestPrice)
+			} else {
+				flashLoanHumanReadableA = flashLoanHumanReadable
+			}
+		}
 
 		// Calculate flash loan fee
 		flashLoanFee := new(big.Float).Mul(
@@ -1200,7 +1408,7 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 			new(big.Float).Quo(flashLoanFeePercent, big.NewFloat(100)),
 		)
 
-		// Calculate potential profit from flash loan
+		// Calculate flash loan profit
 		flashLoanProfitPerToken := new(big.Float).Copy(profitPerToken)
 		flashLoanRawProfit := new(big.Float).Mul(flashLoanHumanReadable, flashLoanProfitPerToken)
 
@@ -1214,9 +1422,8 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 		flashLoanProfitUSD := flashLoanNetProfit
 
 		// Convert to USD if needed
-		if !isStablecoin(tokenA.Symbol) && isStablecoin(tokenB.Symbol) {
-			// If the asset isn't a stablecoin but we're trading against one,
-			// multiply by average price to get USD value
+		if !isStablecoin(borrowToken.Symbol) {
+			// If the asset isn't a stablecoin, multiply by average price to get USD value
 			avgPrice := new(big.Float).Add(lowestPrice, highestPrice)
 			avgPrice = new(big.Float).Quo(avgPrice, big.NewFloat(2))
 			flashLoanProfitUSD = new(big.Float).Mul(flashLoanNetProfit, avgPrice)
@@ -1226,20 +1433,20 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 		var flashLoanValueUSD *big.Float
 
 		if isStablecoin(tokenA.Symbol) {
-			flashLoanValueUSD = new(big.Float).Copy(flashLoanHumanReadable)
+			flashLoanValueUSD = new(big.Float).Copy(flashLoanHumanReadableA)
 		} else if isStablecoin(tokenB.Symbol) {
 			avgPrice := new(big.Float).Add(lowestPrice, highestPrice)
 			avgPrice = new(big.Float).Quo(avgPrice, big.NewFloat(2))
-			flashLoanValueUSD = new(big.Float).Mul(flashLoanHumanReadable, avgPrice)
+			flashLoanValueUSD = new(big.Float).Mul(flashLoanHumanReadableA, avgPrice)
 		} else {
 			// Use same logic as regular trade, but with flash loan amount
 			isTokenAEth := strings.Contains(strings.ToLower(tokenA.Symbol), "eth")
 			isTokenBEth := strings.Contains(strings.ToLower(tokenB.Symbol), "eth")
 
 			if isTokenAEth {
-				flashLoanValueUSD = new(big.Float).Mul(flashLoanHumanReadable, ethPriceInUSD)
+				flashLoanValueUSD = new(big.Float).Mul(flashLoanHumanReadableA, ethPriceInUSD)
 			} else if isTokenBEth {
-				ethValue := new(big.Float).Mul(flashLoanHumanReadable, lowestPrice)
+				ethValue := new(big.Float).Mul(flashLoanHumanReadableA, lowestPrice)
 				flashLoanValueUSD = new(big.Float).Mul(ethValue, ethPriceInUSD)
 			} else {
 				// Default estimate
@@ -1294,7 +1501,7 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 			RecommendedAmount: tradeAmountHumanReadable,
 
 			// Add flash loan information to the opportunity
-			FlashLoanAmount:    flashLoanHumanReadable,
+			FlashLoanAmount:    flashLoanHumanReadableA,
 			FlashLoanProfitUSD: flashLoanProfitUSD,
 			FlashLoanValueUSD:  flashLoanValueUSD,
 			IsFlashLoanViable:  isFlashLoanViable,
@@ -1308,7 +1515,7 @@ func (m *MonitorService) detectArbitrageOpportunities(pairKey string, dexInfos m
 		m.opportunities = append(m.opportunities, opportunity)
 		m.opportunityMu.Unlock()
 
-		// NEW CODE: Send viable opportunities to the executor
+		// Send viable opportunities to the executor
 		if opportunity.IsViable || opportunity.IsFlashLoanViable {
 			// Create context with timeout for execution
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -2194,6 +2401,28 @@ func createDefaultConfig(path string) (*Configuration, error) {
 	return config, nil
 }
 
+// UpdateAavePoolAddress updates the Aave pool address in the configuration
+// Call this from your main function after loading the config
+func (m *MonitorService) UpdateAavePoolAddress(network string) {
+	switch strings.ToLower(network) {
+	case "sepolia", "sepolia-testnet":
+		m.config.LenderConfig.AavePoolAddress = common.HexToAddress("0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951")
+		m.logger.Success("Updated Aave pool address to Sepolia testnet: %s", m.config.LenderConfig.AavePoolAddress.String())
+	case "goerli", "goerli-testnet":
+		m.config.LenderConfig.AavePoolAddress = common.HexToAddress("0x368EedF3f56ad10b9bC57eed4Dac65B26Bb667f6")
+		m.logger.Success("Updated Aave pool address to Goerli testnet: %s", m.config.LenderConfig.AavePoolAddress.String())
+	case "mainnet", "ethereum":
+		m.config.LenderConfig.AavePoolAddress = common.HexToAddress("0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2")
+		m.logger.Success("Updated Aave pool address to Ethereum mainnet V3: %s", m.config.LenderConfig.AavePoolAddress.String())
+	default:
+		m.logger.Error("Unknown network: %s. Please set Aave pool address manually.", network)
+		return
+	}
+
+	// Save the updated config
+	m.saveConfig()
+}
+
 // Helper function to determine if a token is a stablecoin
 func isStablecoin(symbol string) bool {
 	symbol = strings.ToUpper(symbol)
@@ -2473,6 +2702,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create monitor service: %v", err)
 	}
+
+	service.UpdateAavePoolAddress("sepolia")
+
 	// Start monitor service
 	service.Start()
 
